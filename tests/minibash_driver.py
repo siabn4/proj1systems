@@ -81,12 +81,25 @@ class TestConfig:
     points: int
     script_path: str
     expected_path: Optional[str] = None
+    input_path: Optional[str] = None
     
     def __post_init__(self):
         """Convert paths to Path objects."""
         self.script_path = Path(self.script_path)
         if self.expected_path:
             self.expected_path = Path(self.expected_path)
+        if self.input_path:
+            self.input_path = Path(self.input_path)
+
+
+def unpack_shell_test(test_data):
+    """Return script, expected-output, and optional standard-input paths."""
+    if len(test_data) == 2:
+        script_path, expected_path = test_data
+        return script_path, expected_path, None
+
+    script_path, expected_path, input_path = test_data
+    return script_path, expected_path, input_path
 
 
 class PointSystem:
@@ -202,8 +215,8 @@ class PointSystem:
         """Distribute points among tests based on categories.
         
         Args:
-            basic_tests: Dict of basic test names -> (script_path, expected_path)
-            advanced_tests: Dict of advanced test names -> (script_path, expected_path)
+            basic_tests: Dict of basic test names -> (script_path, expected_path, input_path)
+            advanced_tests: Dict of advanced test names -> (script_path, expected_path, input_path)
             python_tests: Dict of python test names -> (script_path, expected_path)
         """
         # Count tests in each category
@@ -220,26 +233,30 @@ class PointSystem:
         advanced_remainder = self.advanced_total % advanced_count if advanced_count > 0 else 0
         
         # Create test configs for basic tests
-        for i, (test_name, (script_path, expected_path)) in enumerate(basic_tests.items()):
+        for i, (test_name, test_data) in enumerate(basic_tests.items()):
+            script_path, expected_path, input_path = unpack_shell_test(test_data)
             points = basic_points_per_test + (1 if i < basic_remainder else 0)
             config = TestConfig(
                 name=test_name,
                 category='basic',
                 points=points,
                 script_path=str(script_path),
-                expected_path=str(expected_path) if expected_path else None
+                expected_path=str(expected_path) if expected_path else None,
+                input_path=str(input_path) if input_path else None
             )
             self.add_test_config(config)
         
         # Create test configs for advanced tests
-        for i, (test_name, (script_path, expected_path)) in enumerate(advanced_tests.items()):
+        for i, (test_name, test_data) in enumerate(advanced_tests.items()):
+            script_path, expected_path, input_path = unpack_shell_test(test_data)
             points = advanced_points_per_test + (1 if i < advanced_remainder else 0)
             config = TestConfig(
                 name=test_name,
                 category='advanced', 
                 points=points,
                 script_path=str(script_path),
-                expected_path=str(expected_path) if expected_path else None
+                expected_path=str(expected_path) if expected_path else None,
+                input_path=str(input_path) if input_path else None
             )
             self.add_test_config(config)
         
@@ -594,7 +611,7 @@ def discover_tests(script_dir):
 
 def discover_sh_tests(script_dir):
     """
-    Discover all .sh test scripts and their corresponding .out or .reg files.
+    Discover all .sh test scripts and their corresponding output and optional input files.
     
     Args:
         script_dir: Directory to search for test files
@@ -602,9 +619,11 @@ def discover_sh_tests(script_dir):
     Returns:
         Dict mapping categories to test dictionaries:
         {
-            'basic': {test_name: (script_path, expected_path), ...},
-            'advanced': {test_name: (script_path, expected_path), ...}
+            'basic': {test_name: (script_path, expected_path, input_path), ...},
+            'advanced': {test_name: (script_path, expected_path, input_path), ...}
         }
+
+        input_path is None when no same-named .in file exists.
     """
     sh_tests = {"basic": {}, "advanced": {}}
     test_scripts = glob.glob(str(script_dir / "*.sh"))
@@ -616,6 +635,7 @@ def discover_sh_tests(script_dir):
         # Look for .out file first, then .reg file
         out_path = script_dir / f"{test_name}.out"
         reg_path = script_dir / f"{test_name}.reg"
+        input_path = script_dir / f"{test_name}.in"
         
         expected_path = None
         if out_path.exists():
@@ -640,7 +660,11 @@ def discover_sh_tests(script_dir):
                     # If we can't parse the number, default to basic
                     category = "basic"
             
-            sh_tests[category][test_name] = (script_path, expected_path)
+            sh_tests[category][test_name] = (
+                script_path,
+                expected_path,
+                input_path if input_path.exists() else None,
+            )
         else:
             print(f"Warning: No .out or .reg file found for {script_path}")
     
@@ -687,22 +711,25 @@ def run_test(test_name, script_path, shell_path="./minibash", verbose=False, val
         return False, f"Error running {test_name}: {str(e)}"
 
 
-def run_valgrind_on_shell(script_path, shell_path="./minibash"):
+def run_valgrind_on_shell(script_path, shell_path="./minibash", input_path=None):
     """
     Run valgrind on a shell script and return the raw valgrind output.
     
     Args:
         script_path: Path to the .sh script
         shell_path: Path to the shell executable to test
+        input_path: Optional path whose contents are provided as standard input
     
     Returns:
         Tuple of (success: bool, valgrind_output: str)
     """
     try:
         cmd = ["valgrind", "--leak-check=full", "--error-exitcode=1", shell_path, str(script_path)]
+        input_text = Path(input_path).read_text(encoding="utf-8") if input_path else None
         
         result = subprocess.run(
             cmd,
+            input=input_text,
             capture_output=True,
             text=True,
             timeout=30
@@ -758,7 +785,8 @@ def check_valgrind_for_leaks(output):
 
 
 
-def run_sh_test(test_name, script_path, expected_path, shell_path="./minibash", verbose=False, valgrind=False):
+def run_sh_test(test_name, script_path, expected_path, shell_path="./minibash", verbose=False,
+                valgrind=False, input_path=None):
     """
     Run a .sh test script and compare output with expected .out or .reg file.
     
@@ -769,6 +797,7 @@ def run_sh_test(test_name, script_path, expected_path, shell_path="./minibash", 
         shell_path: Path to the shell executable to test
         verbose: Whether to show verbose output
         valgrind: Whether to run with valgrind memory leak checking
+        input_path: Optional path whose contents are provided as standard input
     
     Returns:
         Tuple of (success: bool, output: str)
@@ -779,6 +808,8 @@ def run_sh_test(test_name, script_path, expected_path, shell_path="./minibash", 
             cmd = ["valgrind", "--leak-check=full", shell_path, str(script_path)]
         else:
             cmd = [shell_path, str(script_path)]
+
+        input_text = Path(input_path).read_text(encoding="utf-8") if input_path else None
         
         os.environ['PATH'] = f'{script_path.parent}{os.pathsep}{os.environ["PATH"]}'
         
@@ -799,7 +830,7 @@ def run_sh_test(test_name, script_path, expected_path, shell_path="./minibash", 
                 # Allow extra time for the timing-sensitive tests to complete
                 # 200-while-complex runs for 5 seconds, 201-while-complex-2 runs for 3 seconds
                 timeout_seconds = 15  # Give extra buffer time
-                stdout, stderr = process.communicate(timeout=timeout_seconds)
+                stdout, stderr = process.communicate(input=input_text, timeout=timeout_seconds)
                 
                 actual_output = stdout
                 result_returncode = process.returncode
@@ -814,6 +845,7 @@ def run_sh_test(test_name, script_path, expected_path, shell_path="./minibash", 
             timeout = 30  # Allow up to 30 seconds for tests to complete
             result = subprocess.run(
                 cmd,
+                input=input_text,
                 capture_output=True,
                 text=True,
                 timeout=timeout
@@ -979,15 +1011,17 @@ def run_all_tests(shell_path="./minibash", verbose=False, point_system=None, wit
             # Sort tests by name for consistent output
             for test_name in sorted(category_tests.keys()):
                 current_test += 1
-                script_path, expected_path = category_tests[test_name]
+                script_path, expected_path, input_path = unpack_shell_test(category_tests[test_name])
                 
                 # Run the functional test first
-                success, output = run_sh_test(test_name, script_path, expected_path, shell_path, verbose, False)
+                success, output = run_sh_test(
+                    test_name, script_path, expected_path, shell_path, verbose, False, input_path
+                )
                 
                 # Check valgrind if enabled
                 valgrind_failed = False
                 if with_valgrind:
-                    _, valgrind_output = run_valgrind_on_shell(script_path, shell_path)
+                    _, valgrind_output = run_valgrind_on_shell(script_path, shell_path, input_path)
                     no_memory_leaks = check_valgrind_for_leaks(valgrind_output)
                     point_system.record_valgrind_result(test_name, no_memory_leaks)
                     valgrind_failed = not no_memory_leaks
@@ -1035,7 +1069,7 @@ def run_shell_tests_category(category, category_tests, shell_path="./minibash", 
     
     Args:
         category: Category name ('basic' or 'advanced')
-        category_tests: Dict of test_name -> (script_path, out_path)
+        category_tests: Dict of test_name -> (script_path, expected_path, input_path)
         shell_path: Path to the shell executable to test
         verbose: Whether to show verbose output
         point_system: PointSystem instance for scoring
@@ -1069,15 +1103,17 @@ def run_shell_tests_category(category, category_tests, shell_path="./minibash", 
     
     for test_name in sorted(category_tests.keys()):
         current_test += 1
-        script_path, expected_path = category_tests[test_name]
+        script_path, expected_path, input_path = unpack_shell_test(category_tests[test_name])
         
         # Run the functional test first
-        success, output = run_sh_test(test_name, script_path, expected_path, shell_path, verbose, False)
+        success, output = run_sh_test(
+            test_name, script_path, expected_path, shell_path, verbose, False, input_path
+        )
         
         # Check valgrind if enabled
         valgrind_failed = False
         if with_valgrind:
-            _, valgrind_output = run_valgrind_on_shell(script_path, shell_path)
+            _, valgrind_output = run_valgrind_on_shell(script_path, shell_path, input_path)
             no_memory_leaks = check_valgrind_for_leaks(valgrind_output)
             point_system.record_valgrind_result(test_name, no_memory_leaks)
             valgrind_failed = not no_memory_leaks
@@ -1450,11 +1486,13 @@ Examples:
             if category_tests:
                 print(f"  {category.title()}:")
                 for test_name in sorted(category_tests.keys()):
+                    _, _, input_path = unpack_shell_test(category_tests[test_name])
+                    input_note = f", stdin: {input_path.name}" if input_path else ""
                     if test_name in point_system.test_configs:
                         points = point_system.test_configs[test_name].points
-                        print(f"    {test_name} ({points} pts)")
+                        print(f"    {test_name} ({points} pts{input_note})")
                     else:
-                        print(f"    {test_name}")
+                        print(f"    {test_name}{input_note}")
         
         print("\n" + point_system.get_summary())
         return
@@ -1493,16 +1531,21 @@ Examples:
         for category in ['basic', 'advanced']:
             category_tests = sh_tests.get(category, {})
             if args.test in category_tests:
-                script_path, expected_path = category_tests[args.test]
+                script_path, expected_path, input_path = unpack_shell_test(category_tests[args.test])
                 print(f"Running shell script test ({category}): {args.test}")
                 print(f"Script: {script_path}")
                 print(f"Expected: {expected_path}")
+                if input_path:
+                    print(f"Input: {input_path}")
                 
-                success, output = run_sh_test(args.test, script_path, expected_path, args.shell, args.verbose)
+                success, output = run_sh_test(
+                    args.test, script_path, expected_path, args.shell, args.verbose,
+                    input_path=input_path
+                )
                 
                 # Check valgrind if requested
                 if args.valgrind:
-                    _, valgrind_output = run_valgrind_on_shell(script_path, args.shell)
+                    _, valgrind_output = run_valgrind_on_shell(script_path, args.shell, input_path)
                     no_memory_leaks = check_valgrind_for_leaks(valgrind_output)
                     if not no_memory_leaks and success:
                         output = output.replace("PASS:", "PASS (valgrind failed):")

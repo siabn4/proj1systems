@@ -1,0 +1,12 @@
+mkdir .tmp
+touch .tmp/abc
+touch .tmp/abd
+touch .tmp/abe
+echo .tmp/ab*
+echo .tmp/ab?
+echo .tmp/ab[ce]
+echo .tmp/????
+echo .tmp/???
+echo .tmp/a?[e]
+rm .tmp/???
+rmdir .tmp

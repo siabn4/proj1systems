@@ -1,4 +1,5 @@
 if [ -x /usr/bin/true ]; then
+	# this should be true
 	bintrue=/usr/bin/true
 elif [ -x /sbin/true ]; then
 	bintrue=/sbin/true

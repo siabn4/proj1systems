@@ -19,6 +19,7 @@ echo $bintrue
 
 bintrue=wrong
 if [ -x /bin/doesnotexist ]; then
+    # should not exist
     bintrue=wrong
 elif [ -x /usr/bin/doesnotexist ]; then
     bintrue=wrong
