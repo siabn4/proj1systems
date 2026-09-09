@@ -16,6 +16,7 @@
 #include <termios.h>
 #include <sys/wait.h>
 #include <assert.h>
+#include <time.h>
 
 #include <tree_sitter/api.h>
 #include "tree_sitter/tree-sitter-bash.h"
@@ -181,14 +182,21 @@ sigchld_handler(int sig, siginfo_t *info, void *_ctxt)
 }
 
 /* Wait for all processes in this job to complete, or for
- * the job no longer to be in the foreground.
+ * this job to change status - for instance, for the job to no longer be
+ * in the foreground.  (Pass the job's current status to wait for all
+ * processes that are part of the job to complete.)
  *
- * You should call this function from where you wait for
- * jobs started without the &; you would only use this function
- * if you were to implement the 'fg' command (job control only).
+ * You should call this function with fromstatus==FOREGROUND from where
+ * you wait for jobs started without the &; you could use this function
+ * if you were to implement the 'fg' command as well (job control only).
+ *
+ * You can also use this function to wait for background jobs (if you
+ * were to implement the `wait` built-in.)
  * 
- * Implement handle_child_status such that it records the 
- * information obtained from waitpid() for pid 'child.'
+ * This function calls, and relies on a correct implementation of, the
+ * handle_child_status function.  It must record the information obtained
+ * from waitpid() for pid 'child', updating any job status changes that
+ * may result.
  *
  * If a process exited, it must find the job to which it
  * belongs and decrement num_processes_alive.
@@ -200,16 +208,16 @@ sigchld_handler(int sig, siginfo_t *info, void *_ctxt)
  * jobs from the job list until when your code will no
  * longer touch them.
  *
- * The code below relies on `job->status` having been set to FOREGROUND
- * and `job->num_processes_alive` having been set to the number of
+ * The code below relies on `job->status` having been set to the waited-for
+ * job's status and `job->num_processes_alive` having been set to the number of
  * processes successfully forked for this job.
  */
 static void
-wait_for_job(struct job *job)
+wait_for_job_to_change_status(struct job *job, int fromstatus)
 {
     assert(signal_is_blocked(SIGCHLD));
 
-    while (job->status == FOREGROUND && job->num_processes_alive > 0) {
+    while (job->status == fromstatus && job->num_processes_alive > 0) {
         int status;
 
         pid_t child = waitpid(-1, &status, WUNTRACED);
@@ -254,7 +262,7 @@ handle_child_status(pid_t pid, int status)
  * A program's named children are various types of statements which 
  * you can start implementing here.
  */
-static void 
+static void
 run_program(TSNode program)
 {
     uint32_t n = ts_node_named_child_count(program);
@@ -307,6 +315,7 @@ main(int ac, char *av[])
 {
     int opt;
     tommy_hashdyn_init(&shell_vars);
+    srandom(time(NULL));
 
     /* Process command-line arguments. See getopt(3) */
     while ((opt = getopt(ac, av, "h")) > 0) {
@@ -316,6 +325,7 @@ main(int ac, char *av[])
             break;
         }
     }
+    int nextarg = optind;
 
     parser = ts_parser_new();
     const TSLanguage *bash = tree_sitter_bash();
@@ -353,7 +363,7 @@ main(int ac, char *av[])
 
         char *userinput = NULL;
         /* Do not output a prompt unless shell's stdin is a terminal */
-        if (isatty(0) && av[optind] == NULL) {
+        if (isatty(0) && av[nextarg] == NULL) {
             char *prompt = isatty(0) ? build_prompt() : NULL;
             userinput = readline(prompt);
             free (prompt);
@@ -361,8 +371,8 @@ main(int ac, char *av[])
                 break;
         } else {
             int readfd = 0;
-            if (av[optind] != NULL)
-                readfd = open(av[optind], O_RDONLY);
+            if (av[nextarg] != NULL)
+                readfd = open(av[nextarg], O_RDONLY);
 
             userinput = read_script_from_fd(readfd);
             close(readfd);
