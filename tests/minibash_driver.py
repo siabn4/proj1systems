@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 """
-Generic minibash driver for running test scripts with corresponding .reg template files.
-Each test script (e.g., echo_test.py) should have a corresponding .reg file (e.g., echo_test.reg).
+Minibash driver for running shell test scripts with corresponding .out or .reg files.
+Tests may also supply standard input through a same-named .in file.
 
 Features:
 - Configurable point system with default 55/30/15 basic/advanced/valgrind split
 - Extra tests (300+) add up to 20 points on top of the 100-point base
 - Individual test point configuration
 - Category-based scoring and reporting
+- JSON export with per-test output and memory-check diagnostics
 """
 
 import os
@@ -15,6 +16,11 @@ import sys
 import subprocess
 import glob
 import time
+import json
+import re
+import shutil
+import io
+from contextlib import nullcontext, redirect_stdout
 from pathlib import Path
 from dataclasses import dataclass
 from typing import Dict, Tuple, Optional
@@ -26,7 +32,15 @@ DEFAULT_EXTRA_RATIO = 0.2
 DEFAULT_EXTRA_POINTS = 20
 VALGRIND_POINTS = 15
 SHELL_CATEGORIES = ('basic', 'advanced', 'extra')
-SCORE_CATEGORIES = (*SHELL_CATEGORIES, 'python', 'valgrind')
+SCORE_CATEGORIES = (*SHELL_CATEGORIES, 'valgrind')
+
+
+def get_terminal_width():
+    return shutil.get_terminal_size(fallback=(80, 24)).columns
+
+
+def clear_progress_line():
+    print(f"\r{' ' * max(0, min(70, get_terminal_width() - 1))}\r", end="")
 
 
 def create_progress_bar(current: int, total: int, width: int = 40) -> str:
@@ -64,25 +78,29 @@ def format_progress_info(current: int, total: int, test_name: str = None, start_
         Formatted progress string
     """
     percentage = (current / total * 100) if total > 0 else 0
-    progress_bar = create_progress_bar(current, total, 30)
-    
-    info_parts = [
-        f"Progress: {current}/{total} ({percentage:.1f}%)",
-        progress_bar
-    ]
-    
-    
+    width = max(0, min(68, get_terminal_width() - 1))
+    info = f"Progress: {current}/{total} ({percentage:.1f}%)"
+    if len(info) > width:
+        info = f"{current}/{total} ({percentage:.1f}%)"
+    bar_width = min(25, width - len(info) - 5)
     if test_name:
-        info_parts.append(f"Running: {test_name}")
-    
-    return " | ".join(info_parts)
+        bar_width = min(bar_width, 10)
+    if bar_width >= 3:
+        info += " | " + create_progress_bar(current, total, bar_width)
+    if test_name and width - len(info) > 6:
+        remaining = width - len(info) - 3
+        label = f"Running: {test_name}"
+        if len(label) > remaining:
+            label = label[:remaining - 3] + "..."
+        info += " | " + label
+    return info[:width]
 
 
 @dataclass
 class TestConfig:
     """Configuration for individual tests and scoring."""
     name: str
-    category: str  # 'basic', 'advanced', 'extra', 'python', 'valgrind'
+    category: str  # 'basic', 'advanced', 'extra', 'valgrind'
     points: int
     script_path: str
     expected_path: Optional[str] = None
@@ -115,7 +133,7 @@ class PointSystem:
         """Initialize point system.
         
         Args:
-            total_points: Base points for functional tests (basic/advanced/python)
+            total_points: Base points for functional tests (basic/advanced)
             basic_ratio: Ratio of points for basic tests (0.0-1.0) 
             valgrind_points: Additional points for valgrind section (additive)
             extra_points: Bonus points for extra tests, independent of functional points
@@ -133,9 +151,11 @@ class PointSystem:
         
         # Track results
         self.results = {}
+        self.test_outputs = {}
         self.test_configs = {}
         # Track valgrind results separately from test correctness
         self.valgrind_results = {}
+        self.valgrind_outputs = {}
         # Track whether valgrind is being used
         self.valgrind_enabled = False
         # Track which tests failed valgrind (but may have passed functionally)
@@ -161,29 +181,23 @@ class PointSystem:
     
     @classmethod
     def create_for_category(cls, category: str, all_basic_tests: Dict, all_advanced_tests: Dict, 
-                          all_python_tests: Dict = None, include_valgrind: bool = False,
+                          include_valgrind: bool = False,
                           all_extra_tests: Dict = None):
         """Create a PointSystem for a specific category with correct proportional points.
         
         Args:
-            category: 'basic', 'advanced', 'extra', or 'python'
+            category: 'basic', 'advanced', or 'extra'
             all_basic_tests: Dict of all basic tests (for calculating proportions)
             all_advanced_tests: Dict of all advanced tests (for calculating proportions)
-            all_python_tests: Dict of all python tests (for calculating proportions)
             include_valgrind: Whether to include valgrind points
             all_extra_tests: Dict of all extra tests
             
         Returns:
             PointSystem instance with correct proportional points for the category
         """
-        # Calculate the overall proportions based on all tests
-        basic_count = len(all_basic_tests)
-        advanced_count = len(all_advanced_tests)
-        python_count = len(all_python_tests) if all_python_tests else 0
-        
         # Create a reference point system to get the correct ratios
         ref_system = cls()
-        ref_system.distribute_points(all_basic_tests, all_advanced_tests, all_python_tests, all_extra_tests)
+        ref_system.distribute_points(all_basic_tests, all_advanced_tests, all_extra_tests)
         
         if category == 'basic':
             # Get the total points that basic tests should have
@@ -204,16 +218,8 @@ class PointSystem:
         elif category == 'extra':
             point_system = cls(total_points=0)
             point_system.extra_total = ref_system.extra_total
-            point_system.distribute_points({}, {}, {}, all_extra_tests)
+            point_system.distribute_points({}, {}, all_extra_tests)
 
-        elif category == 'python':
-            # Python tests get minimal points - use the same allocation as in distribute_points
-            python_total_points = python_count  # 1 point per test
-            point_system = cls(total_points=python_total_points, basic_ratio=0.0)
-            if include_valgrind:
-                point_system.add_valgrind_test()
-            point_system.distribute_points({}, {}, all_python_tests)
-            
         else:
             raise ValueError(f"Unknown category: {category}")
             
@@ -227,20 +233,17 @@ class PointSystem:
         else:
             return self.base_total_points + extra_points
     
-    def distribute_points(self, basic_tests: Dict, advanced_tests: Dict, python_tests: Dict = None,
-                          extra_tests: Dict = None):
+    def distribute_points(self, basic_tests: Dict, advanced_tests: Dict, extra_tests: Dict = None):
         """Distribute points among tests based on categories.
         
         Args:
             basic_tests: Dict of basic test names -> (script_path, expected_path, input_path)
             advanced_tests: Dict of advanced test names -> (script_path, expected_path, input_path)
-            python_tests: Dict of python test names -> (script_path, expected_path)
             extra_tests: Dict of extra test names -> (script_path, expected_path, input_path)
         """
         # Count tests in each category
         basic_count = len(basic_tests)
         advanced_count = len(advanced_tests)
-        python_count = len(python_tests) if python_tests else 0
         
         # Distribute points evenly within categories
         basic_points_per_test = self.basic_total // basic_count if basic_count > 0 else 0
@@ -291,28 +294,21 @@ class PointSystem:
                     input_path=str(input_path) if input_path else None
                 ))
 
-        # Handle Python tests (assign minimal points or distribute from basic pool)
-        if python_tests:
-            python_points_per_test = 1  # Minimal points for python tests
-            for test_name, (script_path, reg_path) in python_tests.items():
-                config = TestConfig(
-                    name=test_name,
-                    category='python',
-                    points=python_points_per_test,
-                    script_path=str(script_path),
-                    expected_path=str(reg_path)
-                )
-                self.add_test_config(config)
-    
-    def record_result(self, test_name: str, passed: bool):
+    def record_result(self, test_name: str, passed: bool, output: str = None):
         """Record test result."""
         self.results[test_name] = passed
+        if output is not None:
+            self.test_outputs[test_name] = output
     
-    def record_valgrind_result(self, test_name: str, no_memory_leaks: bool):
+    def record_valgrind_result(self, test_name: str, no_memory_leaks: bool, output: str = None):
         """Record valgrind result (separate from test correctness)."""
         self.valgrind_results[test_name] = no_memory_leaks
+        if output is not None:
+            self.valgrind_outputs[test_name] = output
         if not no_memory_leaks:
             self.valgrind_failures.add(test_name)
+        else:
+            self.valgrind_failures.discard(test_name)
     
     def test_failed_valgrind(self, test_name: str) -> bool:
         """Check if a test failed valgrind (but may have passed functionally)."""
@@ -344,7 +340,7 @@ class PointSystem:
         """Get current score for category or overall.
         
         Args:
-            category: 'basic', 'advanced', 'extra', 'python', 'valgrind', or None for overall
+            category: 'basic', 'advanced', 'extra', 'valgrind', or None for overall
             
         Returns:
             Tuple of (earned_points, total_possible_points)
@@ -379,6 +375,12 @@ class PointSystem:
         if extra_total:
             percentage += extra_earned / extra_total * DEFAULT_EXTRA_RATIO * 100
         return percentage
+
+    def succeeded(self) -> bool:
+        """Require every selected functional test and requested memory check to pass."""
+        return bool(self.test_configs) and all(
+            self.results.get(name, False) for name in self.test_configs
+        )
     
     def get_summary(self) -> str:
         """Generate scoring summary."""
@@ -400,6 +402,74 @@ class PointSystem:
         return '\n'.join(lines)
 from dataclasses import dataclass
 from typing import Dict, Tuple, Optional
+
+
+def build_json_results(point_system):
+    """Serialize the same recorded results and scores used by text reporting."""
+    categories = {}
+    grouped = {category: [] for category in SCORE_CATEGORIES}
+    errors = []
+    for name, config in point_system.test_configs.items():
+        if config.category == 'valgrind':
+            continue
+        passed = point_system.results.get(name, False)
+        output = point_system.test_outputs.get(name, '')
+        result = {
+            'test_name': name,
+            'passed': passed,
+            'points_earned': config.points if passed else 0,
+            'points_total': config.points,
+            'script_path': str(config.script_path),
+            'expected_path': str(config.expected_path) if config.expected_path else None,
+            'input_path': str(config.input_path) if config.input_path else None,
+            'output': output,
+            'error_output': output if not passed else None,
+            'valgrind_passed': point_system.valgrind_results.get(name),
+        }
+        if not passed:
+            errors.append(f"{name}: {output}")
+        if name in point_system.valgrind_results:
+            memory_output = point_system.valgrind_outputs.get(name, '')
+            result['valgrind_output'] = memory_output
+            if not result['valgrind_passed']:
+                result['valgrind_error'] = memory_output
+                errors.append(f"Valgrind {name}: {memory_output}")
+        grouped[config.category].append(result)
+
+    for category in SCORE_CATEGORIES:
+        earned, possible = point_system.get_score(category)
+        if grouped[category] or possible:
+            categories[category] = {
+                'earned': earned, 'possible': possible,
+                'percentage': earned / possible * 100 if possible else 0,
+            }
+        grouped[category].sort(key=lambda result: result['test_name'])
+    if 'valgrind' in categories:
+        earned, possible = point_system.get_score('valgrind')
+        grouped['valgrind'].append({
+            'test_name': 'valgrind_total',
+            'passed': point_system.results.get('valgrind_memory_check', False),
+            'points_earned': earned, 'points_total': possible,
+        })
+    earned, possible = point_system.get_score()
+    return {
+        'summary': {
+            'overall_success': point_system.succeeded(),
+            'total_score': {
+                'earned': earned, 'possible': possible,
+                'percentage': point_system.get_overall_percentage(),
+            },
+            'categories': categories,
+        },
+        'test_results_by_category': grouped,
+        'errors': errors,
+    }
+
+
+def write_json_results(point_system, output_file):
+    with open(output_file, 'w', encoding='utf-8') as output:
+        json.dump(build_json_results(point_system), output, indent=2, ensure_ascii=False)
+        output.write('\n')
 
 
 def create_table_header():
@@ -438,6 +508,21 @@ def create_table_footer():
     return "=" * 70
 
 
+def get_test_description(script_path):
+    """Read the first nonempty comment, excluding the interpreter line."""
+    try:
+        with open(script_path, encoding='utf-8', errors='replace') as source:
+            for line in source:
+                line = line.strip()
+                if line.startswith('#') and not line.startswith('#!'):
+                    comment = line[1:].strip()
+                    if comment:
+                        return comment
+    except OSError:
+        pass
+    return None
+
+
 def execute_and_display_test(test_name, test_runner_func, test_args, point_system, 
                            current_test, total_tests, start_time, verbose, all_output, valgrind=False, valgrind_failed=False):
     """
@@ -469,7 +554,7 @@ def execute_and_display_test(test_name, test_runner_func, test_args, point_syste
     success, output = test_runner_func(*test_args)
     
     # Record result in point system
-    point_system.record_result(test_name, success)
+    point_system.record_result(test_name, success, output)
     
     if not verbose:
         # Create table row
@@ -481,7 +566,8 @@ def execute_and_display_test(test_name, test_runner_func, test_args, point_syste
             points_text = "N/A"
         
         table_row = create_table_row(test_name, points_text, success, valgrind_failed)
-        print(f"\r{' ' * 120}\r{table_row}")
+        clear_progress_line()
+        print(table_row)
         all_output.append(table_row)
         
         # Show progress indicator between tests if not the last test
@@ -489,24 +575,29 @@ def execute_and_display_test(test_name, test_runner_func, test_args, point_syste
             next_progress_info = format_progress_info(current_test, total_tests, None, start_time)
             print(f"\r{next_progress_info}", end="", flush=True)
     else:
-        # In verbose mode, only show details for failed tests
-        if success:
-            status = "PASS"
-            if test_name in point_system.test_configs:
-                points = point_system.test_configs[test_name].points
-                print(f"  {status}: {test_name} ({points}/{points} pts)")
-            else:
-                print(f"  {status}: {test_name}")
-        else:
-            status = "FAIL"
-            if test_name in point_system.test_configs:
-                points = point_system.test_configs[test_name].points
-                print(f"  {status}: {test_name} (0/{points} pts)")
-            else:
-                print(f"  {status}: {test_name}")
-            # Show full details for failed tests
-            print(f"    Details: {output}")
-            print("-" * 60)
+        config = point_system.test_configs.get(test_name)
+        label = test_name
+        if config:
+            label = config.script_path.name
+            if config.expected_path:
+                label += f" → {config.expected_path.name}"
+            label += f" ({config.points if success else 0}/{config.points} pts)"
+        status = 'PASS' if success else 'FAIL'
+        print(f"  {status}: {label}")
+        if config:
+            comment = get_test_description(config.script_path)
+            if comment:
+                print(f"    Comments: {comment}")
+            if config.input_path:
+                print(f"    Input: {config.input_path.name}")
+        # Keep complete diagnostics, including stderr, regex errors and timeouts.
+        print(f"    Details: {output}")
+        if valgrind_failed:
+            print("    Valgrind: FAIL")
+            print(point_system.valgrind_outputs.get(test_name, 'No Valgrind output available'))
+        elif valgrind:
+            print("    Valgrind: PASS")
+        print("-" * 60)
     
     return success, output
 
@@ -523,7 +614,7 @@ def print_section_header(section_name, verbose, all_output, add_top_separator=Tr
     """
     if not verbose:
         # Clear any existing progress bar before printing section divider
-        print(f"\r{' ' * 120}\r", end="")
+        clear_progress_line()
         section_divider = create_table_section_divider(section_name, add_top_separator)
         print(section_divider)
         all_output.append(section_divider)
@@ -542,7 +633,7 @@ def print_score_summary(point_system, verbose, all_output):
     """
     if not verbose:
         # Clear any existing progress bar before printing final score
-        print(f"\r{' ' * 120}\r", end="")
+        clear_progress_line()
         # Add final score section to table
         final_score_divider = create_table_section_divider("Final Score")
         print(final_score_divider)
@@ -616,40 +707,6 @@ def cleanup_core_files(script_dir):
 
 
 
-def discover_tests(script_dir):
-    """
-    Discover all available test scripts and their corresponding .reg files.
-    
-    Args:
-        script_dir: Directory to search for test files
-    
-    Returns:
-        Dict mapping test names to (script_path, reg_path) tuples
-    """
-    tests = {}
-    test_scripts = glob.glob(str(script_dir / "*_test.py"))
-    
-    # Exclude standalone test scripts that don't follow the *_test.py + .reg pattern
-    excluded_scripts = {'substitution_test.py'}
-    
-    for script_path in test_scripts:
-        script_path = Path(script_path)
-        test_name = script_path.stem  # e.g., "echo_test"
-        
-        # Skip excluded scripts
-        if script_path.name in excluded_scripts:
-            continue
-            
-        reg_path = script_dir / f"{test_name}.reg"
-        
-        if reg_path.exists():
-            tests[test_name] = (script_path, reg_path)
-        else:
-            print(f"Warning: No .reg file found for {script_path}")
-    
-    return tests
-
-
 def discover_sh_tests(script_dir):
     """
     Discover all .sh test scripts and their corresponding output and optional input files.
@@ -715,44 +772,6 @@ def discover_sh_tests(script_dir):
 
 
 
-def run_test(test_name, script_path, shell_path="./minibash", verbose=False, valgrind=False):
-    """
-    Run a specific test script with the given shell.
-    
-    Args:
-        test_name: Name of the test (e.g., "echo_test")
-        script_path: Path to the test script
-        shell_path: Path to the shell executable to test
-        verbose: Whether to show verbose output
-        valgrind: Whether to run with valgrind memory leak checking
-    
-    Returns:
-        Tuple of (success: bool, output: str)
-    """
-    try:
-        # Prepend valgrind command if requested
-        if valgrind:
-            shell_cmd = ["valgrind", "--leak-check=full", shell_path]
-        else:
-            shell_cmd = [shell_path]
-        
-        cmd = ["python3", str(script_path), "--shell"] + shell_cmd
-        if verbose:
-            cmd.append("--verbose")
-        
-        os.environ['PATH'] = f'{script_path.parent}{os.pathsep}{os.environ["PATH"]}'
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-        )
-        
-        return result.returncode == 0, result.stdout + result.stderr
-        
-    except Exception as e:
-        return False, f"Error running {test_name}: {str(e)}"
-
-
 def run_valgrind_on_shell(script_path, shell_path="./minibash", input_path=None):
     """
     Run valgrind on a shell script and return the raw valgrind output.
@@ -763,7 +782,7 @@ def run_valgrind_on_shell(script_path, shell_path="./minibash", input_path=None)
         input_path: Optional path whose contents are provided as standard input
     
     Returns:
-        Tuple of (success: bool, valgrind_output: str)
+        Tuple of (completed_without_memory_errors: bool, full_output: str)
     """
     try:
         cmd = ["valgrind", "--leak-check=full", "--error-exitcode=1", shell_path, str(script_path)]
@@ -774,14 +793,23 @@ def run_valgrind_on_shell(script_path, shell_path="./minibash", input_path=None)
             input=input_text,
             capture_output=True,
             text=True,
+            errors='replace',
             timeout=30
         )
-        
-        # Return success and the stderr output which contains valgrind info
-        return result.returncode == 0, result.stderr
-        
-    except subprocess.TimeoutExpired:
-        return False, "TIMEOUT: Valgrind check exceeded 30 seconds"
+
+        output = f"STDOUT:\n{result.stdout}\nSTDERR:\n{result.stderr}"
+        # Only stderr contains Valgrind diagnostics; program stdout is not evidence.
+        passed = result.returncode == 0 and check_valgrind_for_leaks(result.stderr)
+        if result.returncode:
+            output = f"Valgrind exited with status {result.returncode}\n{output}"
+        return passed, output
+
+    except subprocess.TimeoutExpired as exc:
+        def decode_partial(value):
+            return value.decode('utf-8', errors='replace') if isinstance(value, bytes) else value or ''
+        output = ("TIMEOUT: Valgrind check exceeded 30 seconds\nPartial output:\n"
+                  f"STDOUT:\n{decode_partial(exc.stdout)}\nSTDERR:\n{decode_partial(exc.stderr)}")
+        return False, output
     except Exception as e:
         return False, f"Error running valgrind: {str(e)}"
 
@@ -796,33 +824,17 @@ def check_valgrind_for_leaks(output):
     Returns:
         bool: True if no memory leaks detected, False if leaks found
     """
-    lines = output.split('\n')
-    found_valgrind = False
-    
-    for line in lines:
-        line = line.strip()
-        
-        # Check if this is valgrind output
-        if "Memcheck, a memory error detector" in line:
-            found_valgrind = True
-        
-        # Check for clean exit - no leaks possible
-        if "All heap blocks were freed -- no leaks are possible" in line:
-            return True
-        
-        # Check for any actual leaks (non-zero bytes lost)
-        if "definitely lost:" in line and not "0 bytes" in line:
-            return False
-        
-        if "possibly lost:" in line and not "0 bytes" in line:
-            return False
-    
-    # If we found valgrind output but no leaks were detected, assume clean
-    if found_valgrind:
-        return True
-    
-    # If no valgrind output detected, assume it didn't run with valgrind
-    return False
+    if 'TIMEOUT:' in output:
+        return False
+    losses = re.findall(r'(definitely|indirectly|possibly) lost:\s*([\d,]+) bytes', output)
+    if any(int(count.replace(',', '')) for _, count in losses):
+        return False
+    errors = re.findall(r'ERROR SUMMARY:\s*([\d,]+) errors', output)
+    if any(int(count.replace(',', '')) for count in errors):
+        return False
+    # A startup banner alone does not establish successful completion.
+    return ('All heap blocks were freed -- no leaks are possible' in output
+            or (bool(errors) and {kind for kind, _ in losses} == {'definitely', 'indirectly', 'possibly'}))
 
 
 
@@ -967,7 +979,7 @@ def run_sh_test(test_name, script_path, expected_path, shell_path="./minibash", 
 
 
 def run_all_tests(shell_path="./minibash", verbose=False, point_system=None, with_valgrind=False,
-                  include_extra=True):
+                  include_extra=True, memory_only=False):
     """
     Run all discovered tests with the given shell.
     
@@ -977,12 +989,12 @@ def run_all_tests(shell_path="./minibash", verbose=False, point_system=None, wit
         point_system: PointSystem instance for scoring
         with_valgrind: Whether to also run valgrind memory leak checking
         include_extra: Whether to run extra functional tests (never checked by valgrind)
+        memory_only: Run just memory checks during the separate Valgrind phase
     
     Returns:
         Tuple of (success: bool, output: str, results: dict, point_system: PointSystem)
     """
     script_dir = Path(__file__).resolve().parent
-    py_tests = discover_tests(script_dir)
     sh_tests = discover_sh_tests(script_dir)
     if not include_extra:
         sh_tests['extra'] = {}
@@ -993,14 +1005,13 @@ def run_all_tests(shell_path="./minibash", verbose=False, point_system=None, wit
         point_system.distribute_points(
             sh_tests.get('basic', {}), 
             sh_tests.get('advanced', {}), 
-            py_tests,
             sh_tests.get('extra', {})
         )
     
     # Count total tests for progress tracking
-    total_tests = len(py_tests)
-    for category_tests in sh_tests.values():
-        total_tests += len(category_tests)
+    if with_valgrind and any(sh_tests.get(category) for category in ('basic', 'advanced')):
+        point_system.add_valgrind_test()
+    total_tests = sum(len(category_tests) for category_tests in sh_tests.values())
     
     all_output = []
     results = {}
@@ -1016,39 +1027,6 @@ def run_all_tests(shell_path="./minibash", verbose=False, point_system=None, wit
     else:
         print(f"\nRunning {total_tests} tests in verbose mode...\n")
     
-    # Run Python tests
-    if py_tests:
-        print_section_header("Python Tests", verbose, all_output, add_top_separator=False)
-        
-        for test_name, (script_path, reg_path) in py_tests.items():
-            current_test += 1
-            
-            # Run the functional test first
-            success, output = run_test(test_name, script_path, shell_path, verbose, False)
-            
-            # Check valgrind if enabled
-            valgrind_failed = False
-            if with_valgrind:
-                _, valgrind_output = run_test(test_name, script_path, shell_path, verbose, True)
-                no_memory_leaks = check_valgrind_for_leaks(valgrind_output)
-                point_system.record_valgrind_result(test_name, no_memory_leaks)
-                valgrind_failed = not no_memory_leaks
-            
-            # Display the test result with valgrind status
-            def dummy_runner(*args):
-                return success, output
-            
-            _, _ = execute_and_display_test(
-                test_name, dummy_runner, 
-                (),  # No args needed for dummy runner
-                point_system, current_test, total_tests, start_time, verbose, all_output,
-                valgrind=with_valgrind, valgrind_failed=valgrind_failed
-            )
-            
-            results[test_name] = success
-            if not success:
-                all_success = False
-    
     # Run shell script tests
     for category in SHELL_CATEGORIES:
         category_tests = sh_tests.get(category, {})
@@ -1062,17 +1040,21 @@ def run_all_tests(shell_path="./minibash", verbose=False, point_system=None, wit
                 script_path, expected_path, input_path = unpack_shell_test(category_tests[test_name])
                 
                 # Run the functional test first
-                success, output = run_sh_test(
-                    test_name, script_path, expected_path, shell_path, verbose, False, input_path
-                )
+                if memory_only:
+                    success, output = True, ''
+                else:
+                    success, output = run_sh_test(
+                        test_name, script_path, expected_path, shell_path, verbose, False, input_path
+                    )
                 
                 # Check valgrind if enabled
                 valgrind_failed = False
                 if check_memory:
-                    _, valgrind_output = run_valgrind_on_shell(script_path, shell_path, input_path)
-                    no_memory_leaks = check_valgrind_for_leaks(valgrind_output)
-                    point_system.record_valgrind_result(test_name, no_memory_leaks)
+                    no_memory_leaks, valgrind_output = run_valgrind_on_shell(script_path, shell_path, input_path)
+                    point_system.record_valgrind_result(test_name, no_memory_leaks, valgrind_output)
                     valgrind_failed = not no_memory_leaks
+                    if memory_only:
+                        success, output = no_memory_leaks, valgrind_output
                 
                 # Display the test result with valgrind status
                 def dummy_runner(*args):
@@ -1090,7 +1072,7 @@ def run_all_tests(shell_path="./minibash", verbose=False, point_system=None, wit
                     all_success = False
     
     # Check if any tests were found
-    if not py_tests and not any(sh_tests.values()):
+    if not any(sh_tests.values()):
         return False, "No tests discovered", {}, point_system
     
     # Evaluate valgrind results if valgrind was run
@@ -1108,7 +1090,7 @@ def run_all_tests(shell_path="./minibash", verbose=False, point_system=None, wit
     # Clean up core.die files generated by crash tests
     cleanup_core_files(script_dir)
     
-    return all_success, '\n'.join(all_output), results, point_system
+    return point_system.succeeded(), '\n'.join(all_output), results, point_system
 
 
 def run_shell_tests_category(category, category_tests, shell_path="./minibash", verbose=False, point_system=None, with_valgrind=False):
@@ -1133,9 +1115,12 @@ def run_shell_tests_category(category, category_tests, shell_path="./minibash", 
         if category == 'basic':
             point_system.distribute_points(category_tests, {}, {})
         elif category == 'extra':
-            point_system.distribute_points({}, {}, {}, category_tests)
+            point_system.distribute_points({}, {}, category_tests)
         else:
             point_system.distribute_points({}, category_tests, {})
+
+    if with_valgrind and category_tests:
+        point_system.add_valgrind_test()
     
     all_output = []
     all_success = True
@@ -1165,9 +1150,8 @@ def run_shell_tests_category(category, category_tests, shell_path="./minibash", 
         # Check valgrind if enabled
         valgrind_failed = False
         if with_valgrind:
-            _, valgrind_output = run_valgrind_on_shell(script_path, shell_path, input_path)
-            no_memory_leaks = check_valgrind_for_leaks(valgrind_output)
-            point_system.record_valgrind_result(test_name, no_memory_leaks)
+            no_memory_leaks, valgrind_output = run_valgrind_on_shell(script_path, shell_path, input_path)
+            point_system.record_valgrind_result(test_name, no_memory_leaks, valgrind_output)
             valgrind_failed = not no_memory_leaks
         
         # Display the test result with valgrind status
@@ -1200,69 +1184,7 @@ def run_shell_tests_category(category, category_tests, shell_path="./minibash", 
     script_dir = Path(__file__).resolve().parent
     cleanup_core_files(script_dir)
     
-    return all_success, '\n'.join(all_output), point_system
-
-
-def run_python_tests_only(py_tests, shell_path="./minibash", verbose=False, point_system=None):
-    """
-    Run only Python tests.
-    
-    Args:
-        py_tests: Dict of test_name -> (script_path, reg_path)
-        shell_path: Path to the shell executable to test
-        verbose: Whether to show verbose output
-        point_system: PointSystem instance for scoring
-    
-    Returns:
-        Tuple of (success: bool, output: str, point_system: PointSystem)
-    """
-    # Initialize point system if not provided
-    if point_system is None:
-        point_system = PointSystem()
-        point_system.distribute_points({}, {}, py_tests)
-    
-    all_output = []
-    all_success = True
-    total_tests = len(py_tests)
-    current_test = 0
-    start_time = time.time()
-    
-    if not verbose:
-        # Print unified table header
-        table_header = create_table_header()
-        print(f"\n{table_header}")
-        all_output.append(table_header)
-    else:
-        print(f"\nRunning {total_tests} python tests in verbose mode...\n")
-    
-    print_section_header("Python Tests", verbose, all_output)
-    
-    for test_name, (script_path, reg_path) in py_tests.items():
-        current_test += 1
-        
-        success, output = execute_and_display_test(
-            test_name, run_test,
-            (test_name, script_path, shell_path, verbose, False),  # False for valgrind
-            point_system, current_test, total_tests, start_time, verbose, all_output,
-            valgrind=False, valgrind_failed=False
-        )
-        
-        if not success:
-            all_success = False
-    
-    print_score_summary(point_system, verbose, all_output)
-    
-    # Show completion message
-    if total_tests > 0:
-        elapsed_time = time.time() - start_time
-        completion_msg = f"✓ Completed {total_tests} python tests in {elapsed_time:.1f}s" + "\n"
-        print(completion_msg)
-    
-    # Clean up core.die files generated by crash tests
-    script_dir = Path(__file__).resolve().parent
-    cleanup_core_files(script_dir)
-    
-    return all_success, '\n'.join(all_output), point_system
+    return point_system.succeeded(), '\n'.join(all_output), point_system
 
 
 def run_three_phase_tests(shell_path="./minibash", verbose=False, with_valgrind=True):
@@ -1270,7 +1192,7 @@ def run_three_phase_tests(shell_path="./minibash", verbose=False, with_valgrind=
     Run tests in category phases followed by optional valgrind checking:
     1. Basic tests without valgrind
     2. Advanced tests without valgrind  
-    3. Extra tests without valgrind (plus Python tests, if present)
+    3. Extra tests without valgrind
     4. Non-extra tests with valgrind (if with_valgrind=True)
     
     Args:
@@ -1282,7 +1204,6 @@ def run_three_phase_tests(shell_path="./minibash", verbose=False, with_valgrind=
         Tuple of (overall_success: bool, combined_output: str, final_point_system: PointSystem)
     """
     script_dir = Path(__file__).resolve().parent
-    py_tests = discover_tests(script_dir)
     sh_tests = discover_sh_tests(script_dir)
     
     # Initialize overall point system
@@ -1290,7 +1211,6 @@ def run_three_phase_tests(shell_path="./minibash", verbose=False, with_valgrind=
     overall_point_system.distribute_points(
         sh_tests.get('basic', {}), 
         sh_tests.get('advanced', {}), 
-        py_tests,
         sh_tests.get('extra', {})
     )
     if with_valgrind:
@@ -1314,7 +1234,6 @@ def run_three_phase_tests(shell_path="./minibash", verbose=False, with_valgrind=
             'basic', 
             sh_tests.get('basic', {}), 
             sh_tests.get('advanced', {}), 
-            py_tests,
             include_valgrind=False
         )
         
@@ -1329,7 +1248,8 @@ def run_three_phase_tests(shell_path="./minibash", verbose=False, with_valgrind=
         
         # Record basic test results in overall system
         for test_name in sh_tests['basic']:
-            overall_point_system.record_result(test_name, basic_point_system.results.get(test_name, False))
+            overall_point_system.record_result(test_name, basic_point_system.results.get(test_name, False),
+                                               basic_point_system.test_outputs.get(test_name))
     
     # Phase 2: Advanced tests without valgrind  
     if sh_tests.get('advanced'):
@@ -1341,7 +1261,6 @@ def run_three_phase_tests(shell_path="./minibash", verbose=False, with_valgrind=
             'advanced', 
             sh_tests.get('basic', {}), 
             sh_tests.get('advanced', {}), 
-            py_tests,
             include_valgrind=False
         )
         
@@ -1356,7 +1275,8 @@ def run_three_phase_tests(shell_path="./minibash", verbose=False, with_valgrind=
             
         # Record advanced test results in overall system
         for test_name in sh_tests['advanced']:
-            overall_point_system.record_result(test_name, advanced_point_system.results.get(test_name, False))
+            overall_point_system.record_result(test_name, advanced_point_system.results.get(test_name, False),
+                                               advanced_point_system.test_outputs.get(test_name))
     
     # Phase 3: Extra tests without valgrind
     if sh_tests.get('extra'):
@@ -1368,7 +1288,6 @@ def run_three_phase_tests(shell_path="./minibash", verbose=False, with_valgrind=
             'extra',
             sh_tests.get('basic', {}),
             sh_tests.get('advanced', {}),
-            py_tests,
             all_extra_tests=sh_tests['extra']
         )
         success, output, _ = run_shell_tests_category(
@@ -1379,33 +1298,9 @@ def run_three_phase_tests(shell_path="./minibash", verbose=False, with_valgrind=
         if not success:
             overall_success = False
         for test_name in sh_tests['extra']:
-            overall_point_system.record_result(test_name, extra_point_system.results.get(test_name, False))
+            overall_point_system.record_result(test_name, extra_point_system.results.get(test_name, False),
+                                               extra_point_system.test_outputs.get(test_name))
 
-    # Python tests without valgrind
-    if py_tests:
-        print(f"\n{'='*70}")
-        print("PHASE 3.5: Python Tests (Functional)")
-        print(f"{'='*70}")
-        
-        python_point_system = PointSystem.create_for_category(
-            'python', 
-            sh_tests.get('basic', {}), 
-            sh_tests.get('advanced', {}), 
-            py_tests,
-            include_valgrind=False
-        )
-        
-        success, output, _ = run_python_tests_only(py_tests, shell_path, verbose, python_point_system)
-        
-        phase_results['python_functional'] = success
-        all_output.append(f"Phase 3.5 - Python Tests (Functional):\n{output}")
-        if not success:
-            overall_success = False
-            
-        # Record python test results in overall system
-        for test_name in py_tests:
-            overall_point_system.record_result(test_name, python_point_system.results.get(test_name, False))
-    
     # Phase 4: Non-extra tests with valgrind (if enabled)
     if with_valgrind:
         print(f"\n{'='*70}")
@@ -1416,12 +1311,11 @@ def run_three_phase_tests(shell_path="./minibash", verbose=False, with_valgrind=
         valgrind_point_system.distribute_points(
             sh_tests.get('basic', {}), 
             sh_tests.get('advanced', {}), 
-            py_tests
         )
         valgrind_point_system.add_valgrind_test()
         
         success, output, results, _ = run_all_tests(
-            shell_path, verbose, valgrind_point_system, True, include_extra=False
+            shell_path, verbose, valgrind_point_system, True, include_extra=False, memory_only=True
         )
         
         phase_results['valgrind'] = success
@@ -1429,7 +1323,8 @@ def run_three_phase_tests(shell_path="./minibash", verbose=False, with_valgrind=
         
         # Record valgrind results in overall system
         for test_name, valgrind_result in valgrind_point_system.valgrind_results.items():
-            overall_point_system.record_valgrind_result(test_name, valgrind_result)
+            overall_point_system.record_valgrind_result(test_name, valgrind_result,
+                                                        valgrind_point_system.valgrind_outputs.get(test_name))
         
         # Evaluate valgrind results
         overall_point_system.evaluate_valgrind_results()
@@ -1459,10 +1354,6 @@ def run_three_phase_tests(shell_path="./minibash", verbose=False, with_valgrind=
         status = "✓ PASS" if phase_results['extra_functional'] else "✗ FAIL"
         print(f"  Extra Tests (Functional): {status}")
         
-    if 'python_functional' in phase_results:
-        status = "✓ PASS" if phase_results['python_functional'] else "✗ FAIL"
-        print(f"  Python Tests (Functional): {status}")
-    
     if with_valgrind:
         if 'valgrind' in phase_results:
             valgrind_earned, valgrind_total = overall_point_system.get_score('valgrind')
@@ -1491,7 +1382,7 @@ def run_three_phase_tests(shell_path="./minibash", verbose=False, with_valgrind=
     # Clean up core.die files generated by crash tests
     cleanup_core_files(script_dir)
     
-    return overall_success, '\n'.join(all_output), overall_point_system
+    return overall_point_system.succeeded(), '\n'.join(all_output), overall_point_system
 
 
 def main():
@@ -1505,26 +1396,28 @@ def main():
 Examples:
   python3 minibash_driver.py --shell ./minibash              # Default: basic, advanced, extra, then valgrind
   python3 minibash_driver.py --shell ./minibash --no-valgrind # Skip valgrind phase
-  python3 minibash_driver.py --test echo_test --shell ./minibash --verbose
   python3 minibash_driver.py --test 001-comment --shell ./minibash
   python3 minibash_driver.py -b --shell ./minibash           # Only basic tests
   python3 minibash_driver.py -a --shell ./minibash           # Only advanced tests
   python3 minibash_driver.py -e --shell ./minibash           # Only extra tests (300+)
   python3 minibash_driver.py --valgrind --shell ./minibash   # All tests with valgrind (legacy mode)
   python3 minibash_driver.py --list-tests
+  python3 minibash_driver.py --json -o scores.json --shell ./minibash
+  python3 minibash_driver.py --test 025-sh-pid-var --json --shell ./minibash
         """
     )
     
     parser.add_argument("--shell", default="./minibash", help="Path to shell executable")
-    parser.add_argument("--test", help="Run specific test (e.g., 'echo_test' or '001-comment')")
+    parser.add_argument("--test", help="Run specific shell script test (e.g., '001-comment')")
     parser.add_argument("-b", "--basic", action="store_true", help="Run only basic shell script tests (.sh/.out)")
     parser.add_argument("-a", "--advanced", action="store_true", help="Run only advanced shell script tests (.sh/.out)")
     parser.add_argument("-e", "--extra", action="store_true", help="Run only extra shell script tests (300+, up to 20 bonus points)")
-    parser.add_argument("--python-only", action="store_true", help="Run only Python tests (.py/.reg)")
     parser.add_argument("--valgrind", action="store_true", help="Run all tests with valgrind memory leak checking")
     parser.add_argument("--no-valgrind", action="store_true", help="Skip valgrind testing in default mode")
     parser.add_argument("--list-tests", action="store_true", help="List available tests")
     parser.add_argument("--verbose", "-v", action="store_true", help="Verbose output")
+    parser.add_argument("--json", action="store_true", help="Export a JSON results object for the selected tests")
+    parser.add_argument("-o", "--output", default="scores.json", help="JSON output file (default: scores.json)")
     
     # Point system configuration
     # parser.add_argument("--total-points", type=int, default=DEFAULT_TOTAL_POINTS, help="Functional points available (default: 85)")
@@ -1536,6 +1429,8 @@ Examples:
     if args.valgrind and args.no_valgrind:
         print("Error: --valgrind and --no-valgrind are mutually exclusive")
         sys.exit(1)
+    if args.json and args.list_tests:
+        parser.error("--json exports executed test results; it cannot be combined with --list-tests")
     
     # Validate point system arguments
     # if args.basic_ratio < 0.0 or args.basic_ratio > 1.0:
@@ -1543,30 +1438,17 @@ Examples:
     #     sys.exit(1)
     
     script_dir = Path(__file__).resolve().parent
-    py_tests = discover_tests(script_dir)
     sh_tests = discover_sh_tests(script_dir)
     
     point_system = PointSystem()
     point_system.distribute_points(
         sh_tests.get('basic', {}), 
         sh_tests.get('advanced', {}), 
-        py_tests,
         sh_tests.get('extra', {})
     )
-    # Add valgrind test configuration to show in scoring
-    # (Note: valgrind only enabled when --valgrind is used)
-    point_system.add_valgrind_test()
     
     if args.list_tests:
-        print("Available Python tests (.py/.reg):")
-        for test_name in sorted(py_tests.keys()):
-            if test_name in point_system.test_configs:
-                points = point_system.test_configs[test_name].points
-                print(f"  {test_name} ({points} pts)")
-            else:
-                print(f"  {test_name}")
-        
-        print("\nAvailable shell script tests (.sh/.out or .sh/.reg):")
+        print("Available shell script tests (.sh/.out or .sh/.reg):")
         for category in SHELL_CATEGORIES:
             category_tests = sh_tests.get(category, {})
             if category_tests:
@@ -1583,167 +1465,56 @@ Examples:
         print("\n" + point_system.get_summary())
         return
     
+    selected_category = None
+    selected_tests = None
     if args.test:
-        # Run specific test
-        test_found = False
-        
-        # Check Python tests
-        if args.test in py_tests:
-            script_path, reg_path = py_tests[args.test]
-            print(f"Running Python test: {args.test}")
-            print(f"Script: {script_path}")
-            print(f"Template: {reg_path}")
-            
-            success, output = run_test(args.test, script_path, args.shell, args.verbose)
-            
-            # Add point information if available
-            if args.test in point_system.test_configs:
-                points = point_system.test_configs[args.test].points
-                earned = points if success else 0
-                # Pad output to 55 characters and add points in right column
-                base_output = output.rstrip()
-                padded_output = base_output.ljust(55)
-                point_status = f"{earned}/{points} pts"
-                output = padded_output + point_status
-            
-            print(output)
-            
-            # Clean up core.die files generated by crash tests
-            cleanup_core_files(script_dir)
-            
-            sys.exit(0 if success else 1)
-        
-        # Check shell script tests
         for category in SHELL_CATEGORIES:
-            category_tests = sh_tests.get(category, {})
-            if args.test in category_tests:
-                script_path, expected_path, input_path = unpack_shell_test(category_tests[args.test])
-                print(f"Running shell script test ({category}): {args.test}")
-                print(f"Script: {script_path}")
-                print(f"Expected: {expected_path}")
-                if input_path:
-                    print(f"Input: {input_path}")
-                
-                success, output = run_sh_test(
-                    args.test, script_path, expected_path, args.shell, args.verbose,
-                    input_path=input_path
-                )
-                
-                # Check valgrind if requested
-                if args.valgrind and category != 'extra':
-                    _, valgrind_output = run_valgrind_on_shell(script_path, args.shell, input_path)
-                    no_memory_leaks = check_valgrind_for_leaks(valgrind_output)
-                    if not no_memory_leaks and success:
-                        output = output.replace("PASS:", "PASS (valgrind failed):")
-                
-                # Add point information if available
-                if args.test in point_system.test_configs:
-                    points = point_system.test_configs[args.test].points
-                    earned = points if success else 0
-                    # Pad output to 55 characters and add points in right column
-                    base_output = output.rstrip()
-                    padded_output = base_output.ljust(55)
-                    point_status = f"{earned}/{points} pts"
-                    output = padded_output + point_status
-                
-                print(output)
-                
-                # Clean up core.die files generated by crash tests
-                cleanup_core_files(script_dir)
-                
-                sys.exit(0 if success else 1)
-        
-        print(f"Error: Test '{args.test}' not found.")
-        print("Available Python tests:", ", ".join(py_tests.keys()))
-        all_sh_tests = []
-        for category_tests in sh_tests.values():
-            all_sh_tests.extend(category_tests.keys())
-        print("Available shell script tests:", ", ".join(sorted(all_sh_tests)))
-        sys.exit(1)
-    
-    elif args.basic:
-        # Run only basic shell script tests
-        if not sh_tests.get('basic'):
-            print("No basic shell script tests found.")
-            sys.exit(1)
-        
-        # Create category-specific point system with correct proportional points
-        basic_point_system = PointSystem.create_for_category(
-            'basic', 
-            sh_tests.get('basic', {}), 
-            sh_tests.get('advanced', {}), 
-            py_tests,
-            include_valgrind=args.valgrind
-        )
-        
-        success, output, _ = run_shell_tests_category('basic', sh_tests['basic'], args.shell, args.verbose, basic_point_system, args.valgrind)
-        sys.exit(0 if success else 1)
-    
-    elif args.advanced:
-        # Run only advanced shell script tests
-        if not sh_tests.get('advanced'):
-            print("No advanced shell script tests found.")
-            sys.exit(1)
-        
-        # Create category-specific point system with correct proportional points
-        advanced_point_system = PointSystem.create_for_category(
-            'advanced', 
-            sh_tests.get('basic', {}), 
-            sh_tests.get('advanced', {}), 
-            py_tests,
-            include_valgrind=args.valgrind
-        )
-        
-        success, output, _ = run_shell_tests_category('advanced', sh_tests['advanced'], args.shell, args.verbose, advanced_point_system, args.valgrind)
-        sys.exit(0 if success else 1)
-    
-    elif args.extra:
-        if not sh_tests.get('extra'):
-            print("No extra shell script tests found.")
-            sys.exit(1)
-
-        extra_point_system = PointSystem.create_for_category(
-            'extra',
-            sh_tests.get('basic', {}),
-            sh_tests.get('advanced', {}),
-            py_tests,
-            include_valgrind=args.valgrind,
-            all_extra_tests=sh_tests['extra']
-        )
-        success, output, _ = run_shell_tests_category(
-            'extra', sh_tests['extra'], args.shell, args.verbose, extra_point_system, args.valgrind
-        )
-        sys.exit(0 if success else 1)
-
-    elif args.python_only:
-        # Run only Python tests
-        if not py_tests:
-            print("No Python tests found.")
-            sys.exit(1)
-        
-        # Create category-specific point system with correct proportional points
-        python_point_system = PointSystem.create_for_category(
-            'python', 
-            sh_tests.get('basic', {}), 
-            sh_tests.get('advanced', {}), 
-            py_tests,
-            include_valgrind=False  # Python tests don't typically use valgrind
-        )
-        
-        success, output, _ = run_python_tests_only(py_tests, args.shell, args.verbose, python_point_system)
-        sys.exit(0 if success else 1)
-    
+            if args.test in sh_tests[category]:
+                selected_category = category
+                selected_tests = {args.test: sh_tests[category][args.test]}
+                # Keep the test's existing point allocation within the full suite.
+                point_system.test_configs = {args.test: point_system.test_configs[args.test]}
+                break
+        if selected_tests is None:
+            parser.error(f"Test '{args.test}' not found; use --list-tests to see available tests")
     else:
-        # Run all tests (default behavior: category phases followed by valgrind)
-        # Determine whether to run valgrind based on flags
-        run_valgrind = not args.no_valgrind and not args.valgrind
-        if args.valgrind:
-            # If --valgrind is specified, run old behavior for compatibility
-            success, output, results, final_point_system = run_all_tests(args.shell, args.verbose, point_system, True)
+        selected_category = next(
+            (category for category in SHELL_CATEGORIES if getattr(args, category)), None
+        )
+        if selected_category:
+            selected_tests = sh_tests[selected_category]
+            if not selected_tests:
+                parser.error(f"No {selected_category} shell script tests found")
+            point_system = PointSystem.create_for_category(
+                selected_category, sh_tests['basic'], sh_tests['advanced'],
+                all_extra_tests=sh_tests['extra']
+            )
+
+    # JSON uses the same runners and result collection as interactive execution.
+    # Verbose output can still be requested alongside the JSON file.
+    quiet = redirect_stdout(io.StringIO()) if args.json and not args.verbose else nullcontext()
+    with quiet:
+        if selected_category:
+            success, _, final_point_system = run_shell_tests_category(
+                selected_category, selected_tests, args.shell, args.verbose,
+                point_system, args.valgrind
+            )
+        elif args.valgrind:
+            success, _, _, final_point_system = run_all_tests(
+                args.shell, args.verbose, point_system, True
+            )
         else:
-            # Default behavior: category phases followed by valgrind
-            success, output, final_point_system = run_three_phase_tests(args.shell, args.verbose, run_valgrind)
-        sys.exit(0 if success else 1)
+            success, _, final_point_system = run_three_phase_tests(
+                args.shell, args.verbose, not args.no_valgrind
+            )
+    if args.json:
+        try:
+            write_json_results(final_point_system, args.output)
+        except OSError as exc:
+            print(f"Could not write JSON results to {args.output}: {exc}", file=sys.stderr)
+            sys.exit(1)
+        print(f"Created {args.output} with test results and scores")
+    sys.exit(0 if success else 1)
 
 
 if __name__ == "__main__":
