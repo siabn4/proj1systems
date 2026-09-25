@@ -23,6 +23,8 @@
 #include "ts_symbols.h"
 /* Since the handed out code contains a number of unused functions. */
 #pragma GCC diagnostic ignored "-Wunused-function"
+// Included functions 
+#include <spawn.h>
 
 #include "hashtable.h"
 #include "signal_support.h"
@@ -87,6 +89,10 @@ struct job {
     int  num_processes_alive;   /* The number of processes that we know to be alive */
 
     /* Add additional fields here as needed. */
+    pid_t  *pids; // dynamic array of the pids in the job
+    int     num_pids;   // number of pids in the job
+    int     cap_pids;    // capacity of the pids array
+    int     last_status; // the exit status 
 };
 
 /* Utility functions for job list management.
@@ -109,6 +115,49 @@ get_job_from_jid(int jid)
     return NULL;
 }
 
+static void 
+add_pid_to_job(struct job *job, pid_t pid)
+{
+    // if at the capacity scale up 
+    if (job->num_pids == job->cap_pids)
+    {
+        // if the capcity is starting at 0 then increase to 4
+        if (job->cap_pids == 0)
+        {
+            job->cap_pids = 4;
+        }
+        // otherwise double the capacity 
+        else    
+            job->cap_pids *= 2;
+        // reallocate the memory with the new capacity 
+        job->pids = realloc(job->pids, sizeof(pid_t) * job->cap_pids);
+    }
+    // get the individual pid that was placed into the job
+    job->pids[job->num_pids++] = pid;
+}
+ 
+static struct job *
+find_job_by_pid(pid_t pid)
+{
+    struct list_elem *ele;
+    ele = list_begin(&job_list);
+
+    while ( ele != list_end(&job_list))
+    {
+        struct job *job = list_entry(ele, struct job, elem);
+
+        for (int i = 0; i < job->num_pids; i++)
+        {
+            if (job->pids[i] == pid)
+            {
+                return job;
+            }
+        }
+        ele = list_next(ele);
+    }
+    return NULL;
+}
+
 /* Allocate a new job, optionally adding it to the job list. */
 static struct job *
 allocate_job(bool includeinjoblist)
@@ -116,6 +165,10 @@ allocate_job(bool includeinjoblist)
     struct job * job = malloc(sizeof *job);
     job->num_processes_alive = 0;
     job->jid = -1;
+    job->pids =NULL;
+    job->num_pids = 0;
+    job->cap_pids = 0;
+    job->last_status = 0;
     if (!includeinjoblist)
         return job;
 
@@ -149,6 +202,7 @@ delete_job(struct job *job, bool removeFromJobList)
         assert(job->jid == -1);
     }
     /* add any other job cleanup here. */
+    free(job->pids);
     free(job);
 }
 
@@ -254,6 +308,33 @@ handle_child_status(pid_t pid, int status)
      *         If a process was stopped, save the terminal state.
      */
 
+    struct job *job = find_job_by_pid(pid);
+    if (job == NULL)
+        return;
+
+    // WIFEXITED when child is terminated normally 
+    if (WIFEXITED(status))
+    {
+        // set the status to reflect exited
+        job->last_status = WEXITSTATUS(status);
+        //remove the process from the job
+        job->num_processes_alive--;
+        if (job->num_processes_alive == 0)
+        {
+            job->status = TERMINATED_VIA_EXIT;
+        }
+    }
+    else if (WIFSIGNALED(status))
+    {
+        job->last_status = 128 + WTERMSIG(status);
+        job->num_processes_alive--;
+         if (job->num_processes_alive == 0)
+        {
+            job->status = TERMINATED_VIA_SIGNAL;
+        }
+    } 
+    else if (WIFSTOPPED(status))
+        job->status = STOPPED;
 }
 
 /*
