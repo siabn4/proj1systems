@@ -658,6 +658,124 @@ run_command(TSNode command)
 
 }
 
+static void 
+run_pipeline(TSNode pipeline)
+{
+    uint32_t nde = ts_node_named_child_count(pipeline);
+    if (nde == 0)
+    {
+        return;
+    }
+
+    uint32_t num_pipes = nde - 1;
+
+    int (*pipes)[2] = NULL;
+    if ( nde > 1)
+    {
+        pipes = malloc(sizeof(int[2]) * num_pipes);
+        for ( uint32_t i = 0; i < num_pipes; i++)
+        {
+            if (pipe(pipes[i]) != 0)
+            {
+                utils_error("Pipe failed");
+                free(pipes);
+                return;
+            }
+        }
+    }
+
+    struct job *job = allocate_job(true);
+    job->status = FOREGROUND;
+    job->num_processes_alive = 0;
+
+    // process group leader
+    pid_t leader_pid = -1;
+
+    for (uint32_t i = 0; i < nde; i++)
+    {
+        TSNode cmd_node = ts_node_named_child(pipeline, i);
+        char **argv = grab_argv(cmd_node, input, &shell_vars, last_exit_status);
+
+        posix_spawn_file_actions_t file_actions;
+        posix_spawn_file_actions_init(&file_actions);
+
+        // not the first command
+        if (i > 0)
+        {
+            //stdin comes from the previous pipe end 
+            posix_spawn_file_actions_adddup2(&file_actions, pipes[i - 1][0], STDIN_FILENO);
+        }
+        if (i + 1 < nde)
+        {
+            posix_spawn_file_actions_adddup2(&file_actions, pipes[i][1], STDOUT_FILENO);
+        }
+        // close all pipes
+        if (nde > 1)
+        {
+            for (uint32_t j = 0; j < num_pipes; j++)
+            {
+                posix_spawn_file_actions_addclose(&file_actions, pipes[j][0]);
+                posix_spawn_file_actions_addclose(&file_actions, pipes[j][1]);
+            }
+        }
+
+        posix_spawnattr_t attr;
+        posix_spawnattr_init(&attr);
+
+        if (i == 0)
+        {
+            // set the first process as the froup leader 
+            posix_spawnattr_setpgroup(&attr, 0);
+        }
+        else
+        {
+            posix_spawnattr_setpgroup(&attr, leader_pid);
+        }
+        posix_spawnattr_setflags(&attr, POSIX_SPAWN_SETPGROUP);
+
+        pid_t pid;
+
+        int spawn_result = posix_spawnp(&pid, argv[0], &file_actions, &attr, argv, environ);
+
+        posix_spawn_file_actions_destroy(&file_actions);
+        posix_spawnattr_destroy(&attr);
+
+        for ( int argument = 0; argv[argument] != NULL; argument++)
+        {
+            free(argv[argument]);
+        }
+        free(argv);
+
+        if (spawn_result != 0)
+        {
+            utils_error("posix_spawnp failed");
+            continue;
+        }
+
+        if ( i == 0)
+        {
+            leader_pid = pid;
+        }
+
+        add_pid_to_job(job, pid);
+        job->num_processes_alive++;
+    }
+
+    if (nde > 1)
+    {
+        for ( uint pcount = 0 ; pcount < num_pipes; pcount++)
+        {
+            close(pipes[pcount][0]);
+            close(pipes[pcount][1]);
+        }
+    }
+    free(pipes);
+
+    wait_for_job_to_change_status(job, FOREGROUND);
+    last_exit_status = job->last_status;
+    delete_job(job, true);
+}
+
 /*
  * Run a program.
  *
@@ -697,7 +815,7 @@ run_program(TSNode program)
         }
         else if (ts_node_symbol(child) == sym_pipeline)
         {
-
+            run_pipeline(child);
         }
         else if (ts_node_symbol(child) == sym_redirected_statement)
         {
