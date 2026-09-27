@@ -43,10 +43,12 @@ static TSFieldId leftId, operatorId, rightId;
 static char *input;         // to avoid passing the current input around
 static TSParser *parser;    // a singleton parser instance 
 static tommy_hashdyn shell_vars;        // a hash table containing the internal shell variables
+static int last_exit_status = 0; // exit status of the completed foreground process
 
 static void handle_child_status(pid_t pid, int status);
 static char *read_script_from_fd(int readfd);
 static void execute_script(char *script);
+extern char **environ;
 
 
 static void
@@ -307,7 +309,7 @@ handle_child_status(pid_t pid, int status)
      *         num_processes_alive if appropriate.
      *         If a process was stopped, save the terminal state.
      */
-
+    // find what job the pid belongs to
     struct job *job = find_job_by_pid(pid);
     if (job == NULL)
         return;
@@ -337,6 +339,186 @@ handle_child_status(pid_t pid, int status)
         job->status = STOPPED;
 }
 
+static char *
+word_node_extractor(TSNode node, const char *input, tommy_hashdyn *shell_vars, int last_status)
+{
+    if (ts_node_is_null(node))
+    {
+        return strdup("");
+    }
+
+    TSSymbol sym = ts_node_symbol(node);
+
+    if (sym == sym_raw_string)
+    {
+        uint32_t start = ts_node_start_byte(node);
+        uint32_t end = ts_node_end_byte(node);
+    
+
+        // has to have at least 2 characters for the quotes 
+        if (end - start >= 2)
+        {
+            // get the length of the string minus the quotes
+            uint32_t length = end - start - 2;
+            char *buf = malloc(length + 1);
+            memcpy(buf, input + start + 1, length);
+            buf[length] = '\0';
+            return buf;
+        }
+        return ts_extract_node_text((char *)input, node);
+    }   
+
+    if (sym == sym_string || sym == sym_concatenation)
+    {
+        uint32_t child_count = ts_node_named_child_count(node);
+        char *result = strdup("");
+
+        for (uint32_t i = 0; i < child_count; i++)
+        {
+            TSNode child = ts_node_named_child(node, i);
+            char *part = word_node_extractor(child, input, shell_vars, last_status);
+            if (part)
+            {
+                result = utils_string_concat(result, part);
+            }
+        }
+        return result;
+    }
+
+    if (sym == sym_expansion || sym == sym_simple_expansion)
+    {
+        TSNode var_name_node = ts_node_child_by_field_id(node, variableId);
+        if (ts_node_is_null(var_name_node))
+        {
+            var_name_node = ts_node_named_child(node, 0);
+        }
+
+        char *var_name = ts_extract_node_text((char *)input, var_name_node);
+
+        //strip leading characters like $
+        char *lookup = var_name;
+        if (lookup[0] == '$')
+        {
+            lookup++;
+        }
+        char *val = NULL;
+        if (strcmp(lookup, "?") == 0)
+        {
+            char buf[16];
+            //prevent buffer overflow 
+            snprintf(buf, sizeof(buf), "%d", last_status);
+            val = strdup(buf);
+        }
+        else if (strcmp(lookup, "$") == 0)
+        {
+            char buf[16];
+            //prevent buffer overflow 
+            snprintf(buf, sizeof(buf), "%d", (int)getpid());
+            val = strdup(buf);
+        }
+        else
+        {
+            const char *env_val = hash_get(shell_vars, lookup);
+            if (!env_val)
+            {
+                env_val = getenv(lookup);
+            }
+            if (env_val != NULL)
+            {
+                val = strdup(env_val);
+            }
+            else
+            {
+                val = strdup("");
+            }
+        }
+        free(var_name);
+        return val;
+    }
+    return ts_extract_node_text((char *)input, node);
+}
+
+static char **
+grab_argv(TSNode command, const char *input, tommy_hashdyn *shell_vars, int last_status)
+{
+    // gets all the tokens in the command 
+    uint32_t num = ts_node_named_child_count(command);
+    // allocate the pointers of each token and the null terminator 
+    char **argv = malloc(sizeof(char *) * (num + 1));
+    uint32_t argc = 0;
+
+    // loop through all the tokens of the command
+    for (uint32_t i = 0; i < num; i++)
+    {
+        // save the child containing the text
+        TSNode child = ts_node_named_child(command, i);
+        TSSymbol sym = ts_node_symbol(child);
+        if (sym == sym_file_redirect || sym == sym_heredoc_redirect)
+        { 
+            continue; 
+        }
+        // extract the text from the child 
+        argv[argc++] = word_node_extractor(child, input, shell_vars, last_status);
+    }
+    argv[argc] = NULL;
+
+    return argv;
+}
+
+static void 
+run_command(TSNode command)
+{
+    // save the arguments from the given command 
+    char **argv = grab_argv(command, input, &shell_vars, last_exit_status);
+    // create a new job for processes to be placed in 
+    struct job *job = allocate_job(true);
+    job->status = FOREGROUND;
+    // job has to have at least 1 process to stay active
+    job->num_processes_alive = 1;
+
+    // create a posix spawn variable for files
+    posix_spawn_file_actions_t file_actions;
+    // initiate the file actions 
+    posix_spawn_file_actions_init(&file_actions);
+
+    posix_spawnattr_t attr;
+    // initialize the attributes
+    posix_spawnattr_init(&attr);
+    // set the process group
+    posix_spawnattr_setpgroup(&attr, 0);
+    // set the flags for the command 
+    posix_spawnattr_setflags(&attr, POSIX_SPAWN_SETPGROUP);
+
+    pid_t pid;
+    int process = posix_spawnp(&pid, argv[0], &file_actions, &attr, argv, environ);
+
+    // destroy the spawn object 
+    posix_spawn_file_actions_destroy(&file_actions);
+    posix_spawnattr_destroy(&attr);
+
+    if (process != 0)
+    {
+        utils_error("posix_spawnp failed");
+        for ( int i = 0; argv[i] != NULL; i++)
+        {
+            free(argv[i]);
+        }
+        delete_job(job, true);
+        return;
+    }
+    // add the pid of child to the job list
+    add_pid_to_job(job, pid);
+
+    // wiat for the process to longer be in the foreground meaning it complete
+    wait_for_job_to_change_status(job, FOREGROUND);
+    delete_job(job, true);
+    for ( int i = 0; argv[i] != NULL; i++)
+    {
+        free(argv[i]);
+    }
+
+}
+
 /*
  * Run a program.
  *
@@ -349,7 +531,30 @@ run_program(TSNode program)
     uint32_t n = ts_node_named_child_count(program);
     for (uint32_t i = 0; i < n; i++) {
         TSNode child = ts_node_named_child(program, i);
-        printf("node type `%s` not implemented\n", ts_node_type(child));
+
+        if (ts_node_symbol(child) == sym_command)
+        {
+            run_command(child);
+        }
+        // handles dealing with comments (test 1)
+        else if (ts_node_symbol(child) == sym_comment)
+        {
+            // no output just continue 
+            continue;
+        }
+        else if (ts_node_symbol(child) == sym_pipeline)
+        {
+
+        }
+        else if (ts_node_symbol(child) == sym_redirected_statement)
+        {
+
+        }
+        else
+        {
+            // DO SOMETHING HERE
+            printf("node type `%s` not implemented\n", ts_node_type(child));
+        }
     }
 }
 
