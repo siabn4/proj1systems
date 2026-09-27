@@ -397,7 +397,7 @@ word_node_extractor(TSNode node, const char *input, tommy_hashdyn *shell_vars, i
 
         //strip leading characters like $
         char *lookup = var_name;
-        if (lookup[0] == '$')
+        if (lookup[0] == '$' && lookup[1] != '\0')
         {
             lookup++;
         }
