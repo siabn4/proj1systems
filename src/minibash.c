@@ -48,6 +48,7 @@ static int last_exit_status = 0; // exit status of the completed foreground proc
 static void handle_child_status(pid_t pid, int status);
 static char *read_script_from_fd(int readfd);
 static void execute_script(char *script);
+static char **grab_argv(TSNode command, const char *input, tommy_hashdyn *shell_vars, int last_status);
 extern char **environ;
 
 
@@ -341,6 +342,113 @@ handle_child_status(pid_t pid, int status)
 }
 
 static char *
+run_command_capture(TSNode command)
+{
+    char **argv = grab_argv(command, input, &shell_vars, last_exit_status);
+
+    int pipefd[2];
+    if (pipe(pipefd) == -1)
+    {
+        utils_error("pipe failed");
+        return strdup("");
+    }
+
+    struct job *job = allocate_job(true);
+    job->status = FOREGROUND;
+    job->num_processes_alive = 1;
+
+    posix_spawn_file_actions_t file_actions;
+    posix_spawn_file_actions_init(&file_actions);
+
+    /* Child stdout goes into the pipe. */
+    posix_spawn_file_actions_adddup2(
+        &file_actions, pipefd[1], STDOUT_FILENO);
+
+    posix_spawn_file_actions_addclose(
+        &file_actions, pipefd[0]);
+
+    posix_spawn_file_actions_addclose(
+        &file_actions, pipefd[1]);
+
+    posix_spawnattr_t attr;
+    posix_spawnattr_init(&attr);
+    posix_spawnattr_setpgroup(&attr, 0);
+    posix_spawnattr_setflags(&attr, POSIX_SPAWN_SETPGROUP);
+
+    pid_t pid;
+    int result = posix_spawnp(
+        &pid,
+        argv[0],
+        &file_actions,
+        &attr,
+        argv,
+        environ
+    );
+
+    posix_spawn_file_actions_destroy(&file_actions);
+    posix_spawnattr_destroy(&attr);
+
+    /* Parent does not write into the pipe. */
+    close(pipefd[1]);
+
+    if (result != 0)
+    {
+        close(pipefd[0]);
+
+        for (int i = 0; argv[i] != NULL; i++)
+            free(argv[i]);
+        free(argv);
+
+        delete_job(job, true);
+        return strdup("");
+    }
+
+    add_pid_to_job(job, pid);
+
+    /* Read everything the command wrote to stdout. */
+    size_t capacity = 128;
+    size_t length = 0;
+    char *output = malloc(capacity);
+
+    char buffer[128];
+    ssize_t bytes;
+
+    while ((bytes = read(pipefd[0], buffer, sizeof(buffer))) > 0)
+    {
+        if (length + bytes + 1 > capacity)
+        {
+            while (length + bytes + 1 > capacity)
+                capacity *= 2;
+
+            output = realloc(output, capacity);
+        }
+
+        memcpy(output + length, buffer, bytes);
+        length += bytes;
+    }
+
+    close(pipefd[0]);
+
+    wait_for_job_to_change_status(job, FOREGROUND);
+
+    output[length] = '\0';
+
+    /* Bash removes trailing newlines from command substitution. */
+    while (length > 0 && output[length - 1] == '\n')
+    {
+        output[--length] = '\0';
+    }
+
+    delete_job(job, true);
+
+    for (int i = 0; argv[i] != NULL; i++)
+        free(argv[i]);
+    free(argv);
+
+    return output;
+}
+
+static char *
 word_node_extractor(TSNode node, const char *input, tommy_hashdyn *shell_vars, int last_status)
 {
     if (ts_node_is_null(node))
@@ -452,6 +560,16 @@ word_node_extractor(TSNode node, const char *input, tommy_hashdyn *shell_vars, i
         }
         free(var_name);
         return val;
+    }
+    
+    if (sym == sym_command_substitution)
+    {
+        TSNode command = ts_node_named_child(node, 0);
+        if (ts_node_is_null(command))
+        {
+            return strdup("");
+        }
+        return run_command_capture(command);
     }
     return ts_extract_node_text((char *)input, node);
 }
