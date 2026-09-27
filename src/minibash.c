@@ -198,6 +198,7 @@ delete_job(struct job *job, bool removeFromJobList)
         int jid = job->jid;
         assert(jid != -1);
         assert(jid2job[jid] == job);
+        list_remove(&job->elem);
         jid2job[jid]->jid = -1;
         jid2job[jid] = NULL;
     } else {
@@ -371,6 +372,23 @@ word_node_extractor(TSNode node, const char *input, tommy_hashdyn *shell_vars, i
     if (sym == sym_string || sym == sym_concatenation)
     {
         uint32_t child_count = ts_node_named_child_count(node);
+
+        if (sym == sym_string && child_count == 0)
+        {
+            uint32_t start = ts_node_start_byte(node);
+            uint32_t end = ts_node_end_byte(node);
+            if (end - start >= 2)
+            {
+                uint32_t length = end - start - 2;
+                char *result = malloc(length + 1);
+
+                memcpy(result, input + start + 1, length);
+                result[length] = '\0';
+
+                return result;
+            }
+        }
+
         char *result = strdup("");
 
         for (uint32_t i = 0; i < child_count; i++)
@@ -503,6 +521,7 @@ run_command(TSNode command)
         {
             free(argv[i]);
         }
+        free(argv);
         delete_job(job, true);
         return;
     }
@@ -517,6 +536,7 @@ run_command(TSNode command)
     {
         free(argv[i]);
     }
+    free(argv);
 
 }
 
