@@ -543,6 +543,20 @@ run_program(TSNode program)
             // no output just continue 
             continue;
         }
+        else if (ts_node_symbol(child) == sym_variable_assignment)
+        {
+            TSNode name_node = ts_node_child_by_field_id(child, nameId);
+            TSNode value_node = ts_node_child_by_field_id(child, valueId);
+
+            char *name = ts_extract_node_text(input, name_node);
+            char *value = word_node_extractor(
+                value_node,
+                input,
+                &shell_vars,
+                last_exit_status
+            );
+            hash_put(&shell_vars, name, value);
+        }
         else if (ts_node_symbol(child) == sym_pipeline)
         {
 
