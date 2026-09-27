@@ -511,6 +511,7 @@ run_command(TSNode command)
 
     // wiat for the process to longer be in the foreground meaning it complete
     wait_for_job_to_change_status(job, FOREGROUND);
+    last_exit_status = job->last_status;
     delete_job(job, true);
     for ( int i = 0; argv[i] != NULL; i++)
     {
