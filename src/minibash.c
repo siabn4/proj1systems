@@ -55,6 +55,9 @@ static void run_pipeline(TSNode pipeline);
 static void run_command_redirected(TSNode command, TSNode redirect);
 static void run_pipeline_redirected(TSNode pipeline, TSNode redirect);
 static char *run_pipeline_capture(TSNode pipeline);
+static void run_if_statement(TSNode if_node);
+static void run_test_command(TSNode test_node);
+static bool condition_is_true(TSNode condition);
 extern char **environ;
 
 
@@ -960,6 +963,87 @@ apply_file_redirect(TSNode redirect,
 }
 
 static void
+run_test_command(TSNode test_node)
+{
+    uint32_t count = ts_node_named_child_count(test_node);
+
+    if (count == 0)
+    {
+        last_exit_status = 1;
+        return;
+    }
+
+    TSNode expression = ts_node_named_child(test_node, 0);
+
+    /*
+     * The current tests use:
+     *
+     * [ -x filename ]
+     *
+     * Tree-sitter represents this as:
+     *
+     * test_command
+     *   unary_expression
+     *     test_operator
+     *     word
+     */
+    if (ts_node_symbol(expression) == sym_unary_expression)
+    {
+        TSNode operator_node = ts_node_named_child(expression, 0);
+        TSNode value_node = ts_node_named_child(expression, 1);
+
+        char *operator =
+            ts_extract_node_text(input, operator_node);
+
+        char *value =
+            word_node_extractor(
+                value_node,
+                input,
+                &shell_vars,
+                last_exit_status
+            );
+
+        if (strcmp(operator, "-x") == 0)
+        {
+            if (access(value, X_OK) == 0)
+            {
+                last_exit_status = 0;
+            }
+            else
+            {
+                last_exit_status = 1;
+            }
+        }
+        else
+        {
+            last_exit_status = 1;
+        }
+
+        free(operator);
+        free(value);
+
+        return;
+    }
+
+    last_exit_status = 1;
+}
+
+static bool
+condition_is_true(TSNode condition)
+{
+    if (ts_node_symbol(condition) == sym_test_command)
+    {
+        run_test_command(condition);
+    }
+    else
+    {
+        run_statement(condition);
+    }
+
+    return last_exit_status == 0;
+}
+
+static void
 run_statement(TSNode child)
 {
     if (ts_node_symbol(child) == sym_command)
@@ -1009,11 +1093,11 @@ run_statement(TSNode child)
         }
         else if (ts_node_symbol(child) == sym_if_statement)
         {
-            // run if statment 
+            run_if_statement(child);
         }
         else if (ts_node_symbol(child) == sym_test_command)
         {
-            // run test command 
+            run_test_command(child);
         }
         else
         {
@@ -1022,11 +1106,141 @@ run_statement(TSNode child)
         }
 }
 
+static void
+run_if_statement(TSNode if_node)
+{
+    uint32_t count = ts_node_named_child_count(if_node);
+
+    if (count == 0)
+    {
+        return;
+    }
+
+    /*
+     * The first named child is always the initial condition.
+     */
+    TSNode condition = ts_node_named_child(if_node, 0);
+
+    bool matched = condition_is_true(condition);
+
+    /*
+     * If the first condition succeeded, execute everything
+     * after the condition until we reach an elif or else.
+     */
+    if (matched)
+    {
+        for (uint32_t i = 1; i < count; i++)
+        {
+            TSNode child = ts_node_named_child(if_node, i);
+            TSSymbol sym = ts_node_symbol(child);
+
+            if (sym == sym_elif_clause ||
+                sym == sym_else_clause)
+            {
+                break;
+            }
+
+            if (sym != sym_comment)
+            {
+                run_statement(child);
+            }
+        }
+
+        return;
+    }
+
+    /*
+     * Initial condition was false.
+     * Look through elif clauses.
+     */
+    for (uint32_t i = 1; i < count; i++)
+    {
+        TSNode child = ts_node_named_child(if_node, i);
+        TSSymbol sym = ts_node_symbol(child);
+
+        if (sym == sym_elif_clause)
+        {
+            uint32_t elif_count =
+                ts_node_named_child_count(child);
+
+            if (elif_count == 0)
+            {
+                continue;
+            }
+
+            /*
+             * First child of an elif is its condition.
+             */
+            TSNode elif_condition =
+                ts_node_named_child(child, 0);
+
+            if (condition_is_true(elif_condition))
+            {
+                /*
+                 * Everything after the condition is the
+                 * elif body.
+                 */
+                for (uint32_t j = 1;
+                     j < elif_count;
+                     j++)
+                {
+                    TSNode body_child =
+                        ts_node_named_child(child, j);
+
+                    if (ts_node_symbol(body_child) != sym_comment)
+                    {
+                        run_statement(body_child);
+                    }
+                }
+
+                return;
+            }
+        }
+        else if (sym == sym_else_clause)
+        {
+            /*
+             * None of the previous conditions matched,
+             * so execute the entire else body.
+             */
+            uint32_t else_count =
+                ts_node_named_child_count(child);
+
+            for (uint32_t j = 0;
+                 j < else_count;
+                 j++)
+            {
+                TSNode body_child =
+                    ts_node_named_child(child, j);
+
+                if (ts_node_symbol(body_child) != sym_comment)
+                {
+                    run_statement(body_child);
+                }
+            }
+
+            return;
+        }
+    }
+}
+
 static void 
 run_command(TSNode command)
 {
     // save the arguments from the given command 
     char **argv = grab_argv(command, input, &shell_vars, last_exit_status);
+    if (argv[0] != NULL && strcmp(argv[0], ":") == 0)
+    {
+        last_exit_status = 0;
+
+        for (int i = 0; argv[i] != NULL; i++)
+        {
+            free(argv[i]);
+        }
+
+        free(argv);
+        return;
+    }
+    
     // create a new job for processes to be placed in 
     struct job *job = allocate_job(true);
     job->status = FOREGROUND;
