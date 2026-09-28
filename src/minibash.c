@@ -44,6 +44,7 @@ static char *input;         // to avoid passing the current input around
 static TSParser *parser;    // a singleton parser instance 
 static tommy_hashdyn shell_vars;        // a hash table containing the internal shell variables
 static int last_exit_status = 0; // exit status of the completed foreground process
+static bool is_break = false; // if there is a break command
 
 static void handle_child_status(pid_t pid, int status);
 static char *read_script_from_fd(int readfd);
@@ -56,6 +57,9 @@ static void run_command_redirected(TSNode command, TSNode redirect);
 static void run_pipeline_redirected(TSNode pipeline, TSNode redirect);
 static char *run_pipeline_capture(TSNode pipeline);
 static void run_if_statement(TSNode if_node);
+static void run_for_statement(TSNode for_node);
+static void run_while_statement(TSNode while_node);
+static void run_group_statement(TSNode do_group);
 static void run_test_command(TSNode test_node);
 static bool condition_is_true(TSNode condition);
 extern char **environ;
@@ -1024,6 +1028,76 @@ run_test_command(TSNode test_node)
 
         return;
     }
+    else if (ts_node_symbol(expression) == sym_binary_expression)
+    {
+        TSNode left_node = ts_node_child_by_field_id(expression, leftId);
+        TSNode operator_node = ts_node_child_by_field_id(expression, operatorId);
+        TSNode right_node = ts_node_child_by_field_id(expression, rightId);
+
+        char *left = word_node_extractor(left_node, input, &shell_vars, last_exit_status);
+        char *op = ts_extract_node_text(input, operator_node);
+        char *right = word_node_extractor(right_node, input, &shell_vars, last_exit_status);
+
+        bool result = false;
+
+        // if the operator is an equals 
+        if (strcmp(op, "=") == 0 || strcmp(op, "==") == 0)
+        {
+            result = strcmp(left, right) == 0;
+        }
+        // if operator is not equals for nums
+        else if (strcmp(op, "!=") == 0)
+        {
+            result = strcmp(left, right) != 0;
+        }
+        else if (strcmp(op, "-eq") == 0)
+        {
+            result = atol(left) == atol(right);
+        }
+        // not equal 
+        else if (strcmp(op, "-ne") == 0)
+        {
+            result = atol(left) != atol(right);
+        }
+        else if (strcmp(op, "-lt") == 0)
+        {
+            result = atol(left) < atol(right);
+        }
+        else if (strcmp(op, "-le") == 0)
+        {
+            result = atol(left) <= atol(right);
+        }
+        else if (strcmp(op, "-gt") == 0)
+        {
+            result = atol(left) > atol(right);
+        }
+        else if (strcmp(op, "-ge") == 0)
+        {
+            result = atol(left) >= atol(right);
+        }
+        else if (strcmp(op, "<") == 0)
+        {
+            result = strcmp(left, right) < 0;
+        }
+         else if (strcmp(op, ">") == 0)
+        {
+            result = strcmp(left, right) > 0;
+        }
+
+        if (result)
+        {
+            last_exit_status = 0;
+        }
+        else 
+        {
+            last_exit_status = 1; 
+        }
+
+        free(left);
+        free(op);
+        free(right);
+        return;
+    }
 
     last_exit_status = 1;
 }
@@ -1101,11 +1175,105 @@ run_statement(TSNode child)
         {
             run_test_command(child);
         }
+        else if (ts_node_symbol(child) == sym_for_statement)
+        {
+            run_for_statement(child);
+        }
+        else if (ts_node_symbol(child) == sym_while_statement)
+        {
+            run_while_statement(child);
+        }
         else
         {
-            // DO SOMETHING HERE
             printf("node type `%s` not implemented\n", ts_node_type(child));
         }
+}
+
+static void 
+run_group_statement(TSNode do_group)
+{
+    uint32_t count = ts_node_named_child_count(do_group);
+
+    for (uint32_t i = 0; i < count; i++)
+    {
+        TSNode child = ts_node_named_child(do_group, i);
+
+        if (ts_node_symbol(child) == sym_comment)
+        {
+            continue;
+        }
+        run_statement(child);
+
+        if (is_break)
+        {
+            break;
+        }
+    }
+}
+
+static void 
+run_for_statement(TSNode for_node)
+{
+    TSNode var_node = ts_node_child_by_field_id(for_node, variableId);
+    TSNode body_node = ts_node_child_by_field_id(for_node, bodyId);
+
+    char *var_name = ts_extract_node_text(input, var_node);
+
+    uint32_t count = ts_node_named_child_count(for_node);
+    for (uint32_t i = 0; i < count; i++)
+    {
+        TSNode child = ts_node_named_child(for_node , i);
+
+        if (ts_node_eq(child, var_node) || ts_node_eq(child, body_node))
+        {
+            continue;
+        }
+
+        char *value = word_node_extractor(child, input, &shell_vars, last_exit_status);
+        hash_put(&shell_vars, var_name, value);
+        free(value);
+
+        run_group_statement(body_node);
+
+        if (is_break)
+        {
+            is_break = false;
+            break;
+        }
+    }
+    free(var_name);
+}
+
+static void 
+run_while_statement(TSNode while_node)
+{
+    TSNode condition = ts_node_child_by_field_id(while_node, conditionId);
+    TSNode body = ts_node_child_by_field_id(while_node, bodyId);
+
+    uint32_t start = ts_node_start_byte(while_node);
+    bool is_until = strncmp(input + start, "until", 5) == 0;
+
+    for (;;)
+    {
+        bool cond_val = condition_is_true(condition);
+
+        if (is_until)
+        {
+            cond_val = !cond_val;
+        }
+        if (!cond_val)
+        {
+            break;
+        }
+
+        run_group_statement(body);
+
+        if (is_break)
+        {
+            is_break = false;
+            break;
+        }
+    }
 }
 
 static void
@@ -1232,6 +1400,20 @@ run_command(TSNode command)
     char **argv = grab_argv(command, input, &shell_vars, last_exit_status);
     if (argv[0] != NULL && strcmp(argv[0], ":") == 0)
     {
+        last_exit_status = 0;
+
+        for (int i = 0; argv[i] != NULL; i++)
+        {
+            free(argv[i]);
+        }
+
+        free(argv);
+        return;
+    }
+
+    if (argv[0] != NULL && strcmp(argv[0], "break") == 0)
+    {
+        is_break = true;
         last_exit_status = 0;
 
         for (int i = 0; argv[i] != NULL; i++)
