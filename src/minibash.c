@@ -52,6 +52,8 @@ static char **grab_argv(TSNode command, const char *input, tommy_hashdyn *shell_
 static void run_statement(TSNode child);
 static void run_command(TSNode command);
 static void run_pipeline(TSNode pipeline);
+static void run_command_redirected(TSNode command, TSNode redirect);
+static void run_pipeline_redirected(TSNode pipeline, TSNode redirect);
 extern char **environ;
 
 
@@ -643,6 +645,52 @@ run_list(TSNode list_node)
 
 
 static void
+apply_file_redirect(TSNode redirect,
+                    posix_spawn_file_actions_t *file_actions)
+{
+    TSNode destination =
+        ts_node_child_by_field_id(redirect, destinationId);
+
+    if (ts_node_is_null(destination))
+    {
+        destination = ts_node_named_child(redirect, 0);
+    }
+
+    char *filename =
+        word_node_extractor(destination,
+                            input,
+                            &shell_vars,
+                            last_exit_status);
+
+    char *redirect_text =
+        ts_extract_node_text(input, redirect);
+
+    if (redirect_text[0] == '<')
+    {
+        posix_spawn_file_actions_addopen(
+            file_actions,
+            STDIN_FILENO,
+            filename,
+            O_RDONLY,
+            0
+        );
+    }
+    else if (redirect_text[0] == '>')
+    {
+        posix_spawn_file_actions_addopen(
+            file_actions,
+            STDOUT_FILENO,
+            filename,
+            O_WRONLY | O_CREAT | O_TRUNC,
+            0666
+        );
+    }
+
+    free(filename);
+    free(redirect_text);
+}
+
+static void
 run_statement(TSNode child)
 {
     if (ts_node_symbol(child) == sym_command)
@@ -674,7 +722,17 @@ run_statement(TSNode child)
         }
         else if (ts_node_symbol(child) == sym_redirected_statement)
         {
+            TSNode body = ts_node_named_child(child, 0);
+            TSNode redirect = ts_node_named_child(child, 1);
 
+            if (ts_node_symbol(body) == sym_command)
+            {
+                run_command_redirected(body, redirect);
+            }
+            else if (ts_node_symbol(body) == sym_pipeline)
+            {
+                run_pipeline_redirected(body, redirect);
+            }
         }
         else if (ts_node_symbol(child) == sym_list)
         {
@@ -710,6 +768,18 @@ run_command(TSNode command)
     posix_spawn_file_actions_t file_actions;
     // initiate the file actions 
     posix_spawn_file_actions_init(&file_actions);
+
+    uint32_t child_count = ts_node_named_child_count(command);
+
+    for (uint32_t i = 0; i < child_count; i++)
+    {
+        TSNode child = ts_node_named_child(command, i);
+
+        if (ts_node_symbol(child) == sym_file_redirect)
+        {
+            apply_file_redirect(child, &file_actions);
+        }
+    }
 
     posix_spawnattr_t attr;
     // initialize the attributes
@@ -752,6 +822,69 @@ run_command(TSNode command)
 
 }
 
+static void
+run_command_redirected(TSNode command, TSNode redirect)
+{
+    char **argv = grab_argv(command, input, &shell_vars, last_exit_status);
+
+    struct job *job = allocate_job(true);
+    job->status = FOREGROUND;
+    job->num_processes_alive = 1;
+
+    posix_spawn_file_actions_t file_actions;
+    posix_spawn_file_actions_init(&file_actions);
+
+    apply_file_redirect(redirect, &file_actions);
+
+    posix_spawnattr_t attr;
+    posix_spawnattr_init(&attr);
+    posix_spawnattr_setpgroup(&attr, 0);
+    posix_spawnattr_setflags(&attr, POSIX_SPAWN_SETPGROUP);
+
+    pid_t pid;
+    int process = posix_spawnp(
+        &pid,
+        argv[0],
+        &file_actions,
+        &attr,
+        argv,
+        environ
+    );
+
+    posix_spawn_file_actions_destroy(&file_actions);
+    posix_spawnattr_destroy(&attr);
+
+    if (process != 0)
+    {
+        utils_error("posix_spawnp failed");
+
+        for (int i = 0; argv[i] != NULL; i++)
+        {
+            free(argv[i]);
+        }
+
+        free(argv);
+        delete_job(job, true);
+        return;
+    }
+
+    add_pid_to_job(job, pid);
+
+    wait_for_job_to_change_status(job, FOREGROUND);
+
+    last_exit_status = job->last_status;
+
+    delete_job(job, true);
+
+    for (int i = 0; argv[i] != NULL; i++)
+    {
+        free(argv[i]);
+    }
+
+    free(argv);
+}
+
+
 static void 
 run_pipeline(TSNode pipeline)
 {
@@ -792,6 +925,18 @@ run_pipeline(TSNode pipeline)
 
         posix_spawn_file_actions_t file_actions;
         posix_spawn_file_actions_init(&file_actions);
+
+        uint32_t cmd_children = ts_node_named_child_count(cmd_node);
+
+        for (uint32_t j = 0; j < cmd_children; j++)
+        {
+            TSNode cmd_child = ts_node_named_child(cmd_node, j);
+
+            if (ts_node_symbol(cmd_child) == sym_file_redirect)
+            {
+                apply_file_redirect(cmd_child, &file_actions);
+            }   
+        }
 
         // not the first command
         if (i > 0)
@@ -867,6 +1012,198 @@ run_pipeline(TSNode pipeline)
 
     wait_for_job_to_change_status(job, FOREGROUND);
     last_exit_status = job->last_status;
+    delete_job(job, true);
+}
+
+
+static void
+run_pipeline_redirected(TSNode pipeline, TSNode redirect)
+{
+    uint32_t nde = ts_node_named_child_count(pipeline);
+
+    if (nde == 0)
+    {
+        return;
+    }
+
+    uint32_t num_pipes = nde - 1;
+
+    int (*pipes)[2] = NULL;
+
+    if (nde > 1)
+    {
+        pipes = malloc(sizeof(int[2]) * num_pipes);
+
+        for (uint32_t i = 0; i < num_pipes; i++)
+        {
+            if (pipe(pipes[i]) != 0)
+            {
+                utils_error("Pipe failed");
+                free(pipes);
+                return;
+            }
+        }
+    }
+
+    struct job *job = allocate_job(true);
+    job->status = FOREGROUND;
+    job->num_processes_alive = 0;
+
+    // process group leader
+    pid_t leader_pid = -1;
+
+    for (uint32_t i = 0; i < nde; i++)
+    {
+        TSNode cmd_node = ts_node_named_child(pipeline, i);
+
+        char **argv =
+            grab_argv(cmd_node, input, &shell_vars, last_exit_status);
+
+        posix_spawn_file_actions_t file_actions;
+        posix_spawn_file_actions_init(&file_actions);
+
+        /*
+         * Handle redirects that are inside an individual command.
+         * Example: <.inputfile cat
+         */
+        uint32_t cmd_children = ts_node_named_child_count(cmd_node);
+
+        for (uint32_t j = 0; j < cmd_children; j++)
+        {
+            TSNode cmd_child = ts_node_named_child(cmd_node, j);
+
+            if (ts_node_symbol(cmd_child) == sym_file_redirect)
+            {
+                apply_file_redirect(cmd_child, &file_actions);
+            }
+        }
+
+        // If this is not the first command,
+        // stdin comes from the previous pipe.
+        if (i > 0)
+        {
+            posix_spawn_file_actions_adddup2(
+                &file_actions,
+                pipes[i - 1][0],
+                STDIN_FILENO
+            );
+        }
+
+        // If this is not the last command,
+        // stdout goes into the next pipe.
+        if (i + 1 < nde)
+        {
+            posix_spawn_file_actions_adddup2(
+                &file_actions,
+                pipes[i][1],
+                STDOUT_FILENO
+            );
+        }
+
+        /*
+         * The redirect surrounding the entire pipeline applies
+         * to the final command.
+         *
+         * Example:
+         * cat | rev | wc -m > .outputfile
+         */
+        if (i == nde - 1)
+        {
+            apply_file_redirect(redirect, &file_actions);
+        }
+
+        // Close all pipe file descriptors in the child.
+        if (nde > 1)
+        {
+            for (uint32_t j = 0; j < num_pipes; j++)
+            {
+                posix_spawn_file_actions_addclose(
+                    &file_actions,
+                    pipes[j][0]
+                );
+
+                posix_spawn_file_actions_addclose(
+                    &file_actions,
+                    pipes[j][1]
+                );
+            }
+        }
+
+        posix_spawnattr_t attr;
+        posix_spawnattr_init(&attr);
+
+        if (i == 0)
+        {
+            // First process becomes the process group leader.
+            posix_spawnattr_setpgroup(&attr, 0);
+        }
+        else
+        {
+            // Remaining processes join the same process group.
+            posix_spawnattr_setpgroup(&attr, leader_pid);
+        }
+
+        posix_spawnattr_setflags(
+            &attr,
+            POSIX_SPAWN_SETPGROUP
+        );
+
+        pid_t pid;
+
+        int spawn_result = posix_spawnp(
+            &pid,
+            argv[0],
+            &file_actions,
+            &attr,
+            argv,
+            environ
+        );
+
+        posix_spawn_file_actions_destroy(&file_actions);
+        posix_spawnattr_destroy(&attr);
+
+        for (int argument = 0;
+             argv[argument] != NULL;
+             argument++)
+        {
+            free(argv[argument]);
+        }
+
+        free(argv);
+
+        if (spawn_result != 0)
+        {
+            utils_error("posix_spawnp failed");
+            continue;
+        }
+
+        if (i == 0)
+        {
+            leader_pid = pid;
+        }
+
+        add_pid_to_job(job, pid);
+        job->num_processes_alive++;
+    }
+
+    // Parent closes all pipe file descriptors.
+    if (nde > 1)
+    {
+        for (uint32_t pcount = 0;
+             pcount < num_pipes;
+             pcount++)
+        {
+            close(pipes[pcount][0]);
+            close(pipes[pcount][1]);
+        }
+    }
+
+    free(pipes);
+
+    wait_for_job_to_change_status(job, FOREGROUND);
+
+    last_exit_status = job->last_status;
+
     delete_job(job, true);
 }
 
