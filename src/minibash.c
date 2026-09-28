@@ -675,6 +675,23 @@ apply_file_redirect(TSNode redirect,
             0
         );
     }
+    else if (strncmp(redirect_text, ">&", 2) == 0)
+    {
+        // Redirect stdout to the file
+        posix_spawn_file_actions_addopen( file_actions,
+            STDOUT_FILENO,
+            filename,
+            O_WRONLY | O_CREAT | O_TRUNC,
+            0666
+        );
+
+        // Redirect stderr to the same place as stdout
+        posix_spawn_file_actions_adddup2(
+            file_actions,
+            STDOUT_FILENO,
+            STDERR_FILENO
+        );
+    }
     else if (redirect_text[0] == '>')
     {
         posix_spawn_file_actions_addopen(
@@ -947,6 +964,28 @@ run_pipeline(TSNode pipeline)
         if (i + 1 < nde)
         {
             posix_spawn_file_actions_adddup2(&file_actions, pipes[i][1], STDOUT_FILENO);
+
+            // Check for |&
+            TSNode next_cmd = ts_node_named_child(pipeline, i + 1);
+
+            uint32_t current_end = ts_node_end_byte(cmd_node);
+            uint32_t next_start = ts_node_start_byte(next_cmd);
+
+            for (uint32_t pos = current_end;
+                pos + 1 < next_start;
+                pos++)
+            {
+                if (input[pos] == '|' && input[pos + 1] == '&')
+                {
+                    posix_spawn_file_actions_adddup2(
+                    &file_actions,
+                    pipes[i][1],
+                    STDERR_FILENO
+                    );
+
+                break;
+                }
+            }
         }
         // close all pipes
         if (nde > 1)
@@ -1093,11 +1132,29 @@ run_pipeline_redirected(TSNode pipeline, TSNode redirect)
         // stdout goes into the next pipe.
         if (i + 1 < nde)
         {
-            posix_spawn_file_actions_adddup2(
-                &file_actions,
-                pipes[i][1],
-                STDOUT_FILENO
-            );
+           posix_spawn_file_actions_adddup2(&file_actions, pipes[i][1], STDOUT_FILENO);
+
+            // Check for |&
+            TSNode next_cmd = ts_node_named_child(pipeline, i + 1);
+
+            uint32_t current_end = ts_node_end_byte(cmd_node);
+            uint32_t next_start = ts_node_start_byte(next_cmd);
+
+            for (uint32_t pos = current_end;
+                pos + 1 < next_start;
+                pos++)
+            {
+                if (input[pos] == '|' && input[pos + 1] == '&')
+                {
+                    posix_spawn_file_actions_adddup2(
+                    &file_actions,
+                    pipes[i][1],
+                    STDERR_FILENO
+                    );
+
+                break;
+                }
+            }
         }
 
         /*
