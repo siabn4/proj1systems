@@ -1068,6 +1068,8 @@ run_statement(TSNode child)
                 last_exit_status
             );
             hash_put(&shell_vars, name, value);
+            free(name);
+            free(value);
         }
         else if (ts_node_symbol(child) == sym_pipeline)
         {
