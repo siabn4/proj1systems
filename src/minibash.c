@@ -49,6 +49,9 @@ static void handle_child_status(pid_t pid, int status);
 static char *read_script_from_fd(int readfd);
 static void execute_script(char *script);
 static char **grab_argv(TSNode command, const char *input, tommy_hashdyn *shell_vars, int last_status);
+static void run_statement(TSNode child);
+static void run_command(TSNode command);
+static void run_pipeline(TSNode pipeline);
 extern char **environ;
 
 
@@ -601,6 +604,97 @@ grab_argv(TSNode command, const char *input, tommy_hashdyn *shell_vars, int last
     return argv;
 }
 
+static void
+run_list(TSNode list_node)
+{
+    TSNode left = ts_node_named_child(list_node, 0);
+    TSNode right = ts_node_named_child(list_node, 1);
+
+    bool is_and = false;
+    bool is_or = false;
+
+    uint32_t all_children = ts_node_named_child_count(list_node);
+    for (uint32_t i = 0; i < all_children; i++)
+    {
+        TSNode c = ts_node_child(list_node, i);
+        TSSymbol sym = ts_node_symbol(c);
+        if (sym == anon_sym_AMP_AMP)
+        {
+            is_and = true;
+        }
+        else if (sym == anon_sym_PIPE_PIPE)
+        {
+            is_or = true;
+        }
+    }
+
+    run_statement(left);
+    int left_status = last_exit_status;
+
+    if (is_and && left_status == 0)
+    {
+        run_statement(right);
+    }
+    if (is_or && left_status != 0)
+    {
+        run_statement(right);
+    }
+}
+
+
+static void
+run_statement(TSNode child)
+{
+    if (ts_node_symbol(child) == sym_command)
+        {
+            run_command(child);
+        }
+        // handles dealing with comments (test 1)
+        else if (ts_node_symbol(child) == sym_comment)
+        {
+            // no output just continue 
+        }
+        else if (ts_node_symbol(child) == sym_variable_assignment)
+        {
+            TSNode name_node = ts_node_child_by_field_id(child, nameId);
+            TSNode value_node = ts_node_child_by_field_id(child, valueId);
+
+            char *name = ts_extract_node_text(input, name_node);
+            char *value = word_node_extractor(
+                value_node,
+                input,
+                &shell_vars,
+                last_exit_status
+            );
+            hash_put(&shell_vars, name, value);
+        }
+        else if (ts_node_symbol(child) == sym_pipeline)
+        {
+            run_pipeline(child);
+        }
+        else if (ts_node_symbol(child) == sym_redirected_statement)
+        {
+
+        }
+        else if (ts_node_symbol(child) == sym_list)
+        {
+            run_list(child);
+        }
+        else if (ts_node_symbol(child) == sym_if_statement)
+        {
+            // run if statment 
+        }
+        else if (ts_node_symbol(child) == sym_test_command)
+        {
+            // run test command 
+        }
+        else
+        {
+            // DO SOMETHING HERE
+            printf("node type `%s` not implemented\n", ts_node_type(child));
+        }
+}
+
 static void 
 run_command(TSNode command)
 {
@@ -786,46 +880,10 @@ static void
 run_program(TSNode program)
 {
     uint32_t n = ts_node_named_child_count(program);
-    for (uint32_t i = 0; i < n; i++) {
+    for (uint32_t i = 0; i < n; i++) 
+    {
         TSNode child = ts_node_named_child(program, i);
-
-        if (ts_node_symbol(child) == sym_command)
-        {
-            run_command(child);
-        }
-        // handles dealing with comments (test 1)
-        else if (ts_node_symbol(child) == sym_comment)
-        {
-            // no output just continue 
-            continue;
-        }
-        else if (ts_node_symbol(child) == sym_variable_assignment)
-        {
-            TSNode name_node = ts_node_child_by_field_id(child, nameId);
-            TSNode value_node = ts_node_child_by_field_id(child, valueId);
-
-            char *name = ts_extract_node_text(input, name_node);
-            char *value = word_node_extractor(
-                value_node,
-                input,
-                &shell_vars,
-                last_exit_status
-            );
-            hash_put(&shell_vars, name, value);
-        }
-        else if (ts_node_symbol(child) == sym_pipeline)
-        {
-            run_pipeline(child);
-        }
-        else if (ts_node_symbol(child) == sym_redirected_statement)
-        {
-
-        }
-        else
-        {
-            // DO SOMETHING HERE
-            printf("node type `%s` not implemented\n", ts_node_type(child));
-        }
+        run_statement(child);
     }
 }
 
