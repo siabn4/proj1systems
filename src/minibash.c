@@ -54,6 +54,7 @@ static void run_command(TSNode command);
 static void run_pipeline(TSNode pipeline);
 static void run_command_redirected(TSNode command, TSNode redirect);
 static void run_pipeline_redirected(TSNode pipeline, TSNode redirect);
+static char *run_pipeline_capture(TSNode pipeline);
 extern char **environ;
 
 
@@ -454,6 +455,249 @@ run_command_capture(TSNode command)
 }
 
 static char *
+run_pipeline_capture(TSNode pipeline)
+{
+    uint32_t nde = ts_node_named_child_count(pipeline);
+
+    if (nde == 0)
+    {
+        return strdup("");
+    }
+
+    uint32_t num_pipes = nde - 1;
+
+    int (*pipes)[2] = NULL;
+
+    if (nde > 1)
+    {
+        pipes = malloc(sizeof(int[2]) * num_pipes);
+
+        for (uint32_t i = 0; i < num_pipes; i++)
+        {
+            if (pipe(pipes[i]) != 0)
+            {
+                utils_error("Pipe failed");
+                free(pipes);
+                return strdup("");
+            }
+        }
+    }
+
+    /*
+     * Extra pipe used to capture stdout from the
+     * final command in the pipeline.
+     */
+    int capture_pipe[2];
+
+    if (pipe(capture_pipe) != 0)
+    {
+        utils_error("Capture pipe failed");
+        free(pipes);
+        return strdup("");
+    }
+
+    struct job *job = allocate_job(true);
+    job->status = FOREGROUND;
+    job->num_processes_alive = 0;
+
+    pid_t leader_pid = -1;
+
+    for (uint32_t i = 0; i < nde; i++)
+    {
+        TSNode cmd_node = ts_node_named_child(pipeline, i);
+
+        char **argv =
+            grab_argv(cmd_node, input, &shell_vars, last_exit_status);
+
+        posix_spawn_file_actions_t file_actions;
+        posix_spawn_file_actions_init(&file_actions);
+
+        /*
+         * stdin comes from previous pipeline command.
+         */
+        if (i > 0)
+        {
+            posix_spawn_file_actions_adddup2(
+                &file_actions,
+                pipes[i - 1][0],
+                STDIN_FILENO
+            );
+        }
+
+        /*
+         * Intermediate commands write to the next pipe.
+         */
+        if (i + 1 < nde)
+        {
+            posix_spawn_file_actions_adddup2(
+                &file_actions,
+                pipes[i][1],
+                STDOUT_FILENO
+            );
+        }
+        else
+        {
+            /*
+             * Final command writes to our capture pipe.
+             */
+            posix_spawn_file_actions_adddup2(
+                &file_actions,
+                capture_pipe[1],
+                STDOUT_FILENO
+            );
+        }
+
+        /*
+         * Close normal pipeline descriptors in the child.
+         */
+        if (nde > 1)
+        {
+            for (uint32_t j = 0; j < num_pipes; j++)
+            {
+                posix_spawn_file_actions_addclose(
+                    &file_actions,
+                    pipes[j][0]
+                );
+
+                posix_spawn_file_actions_addclose(
+                    &file_actions,
+                    pipes[j][1]
+                );
+            }
+        }
+
+        /*
+         * Child does not need the read side of capture pipe.
+         */
+        posix_spawn_file_actions_addclose(
+            &file_actions,
+            capture_pipe[0]
+        );
+
+        posix_spawn_file_actions_addclose(
+            &file_actions,
+            capture_pipe[1]
+        );
+
+        posix_spawnattr_t attr;
+        posix_spawnattr_init(&attr);
+
+        if (i == 0)
+        {
+            posix_spawnattr_setpgroup(&attr, 0);
+        }
+        else
+        {
+            posix_spawnattr_setpgroup(&attr, leader_pid);
+        }
+
+        posix_spawnattr_setflags(
+            &attr,
+            POSIX_SPAWN_SETPGROUP
+        );
+
+        pid_t pid;
+
+        int spawn_result = posix_spawnp(
+            &pid,
+            argv[0],
+            &file_actions,
+            &attr,
+            argv,
+            environ
+        );
+
+        posix_spawn_file_actions_destroy(&file_actions);
+        posix_spawnattr_destroy(&attr);
+
+        for (int j = 0; argv[j] != NULL; j++)
+        {
+            free(argv[j]);
+        }
+
+        free(argv);
+
+        if (spawn_result != 0)
+        {
+            utils_error("posix_spawnp failed");
+            continue;
+        }
+
+        if (i == 0)
+        {
+            leader_pid = pid;
+        }
+
+        add_pid_to_job(job, pid);
+        job->num_processes_alive++;
+    }
+
+    /*
+     * Parent no longer needs the ordinary pipeline descriptors.
+     */
+    if (nde > 1)
+    {
+        for (uint32_t i = 0; i < num_pipes; i++)
+        {
+            close(pipes[i][0]);
+            close(pipes[i][1]);
+        }
+    }
+
+    free(pipes);
+
+    /*
+     * Parent only reads from capture_pipe.
+     */
+    close(capture_pipe[1]);
+
+    size_t capacity = 128;
+    size_t length = 0;
+
+    char *output = malloc(capacity);
+    char buffer[128];
+
+    ssize_t bytes;
+
+    while ((bytes = read(
+                capture_pipe[0],
+                buffer,
+                sizeof(buffer))) > 0)
+    {
+        if (length + bytes + 1 > capacity)
+        {
+            while (length + bytes + 1 > capacity)
+            {
+                capacity *= 2;
+            }
+
+            output = realloc(output, capacity);
+        }
+
+        memcpy(output + length, buffer, bytes);
+        length += bytes;
+    }
+
+    close(capture_pipe[0]);
+
+    wait_for_job_to_change_status(job, FOREGROUND);
+
+    output[length] = '\0';
+
+    /*
+     * Command substitution removes trailing newlines.
+     */
+    while (length > 0 && output[length - 1] == '\n')
+    {
+        output[--length] = '\0';
+    }
+
+    delete_job(job, true);
+
+    return output;
+}
+
+static char *
 word_node_extractor(TSNode node, const char *input, tommy_hashdyn *shell_vars, int last_status)
 {
     if (ts_node_is_null(node))
@@ -569,12 +813,20 @@ word_node_extractor(TSNode node, const char *input, tommy_hashdyn *shell_vars, i
     
     if (sym == sym_command_substitution)
     {
-        TSNode command = ts_node_named_child(node, 0);
-        if (ts_node_is_null(command))
+        TSNode child = ts_node_named_child(node, 0);
+        if (ts_node_is_null(child))
         {
             return strdup("");
         }
-        return run_command_capture(command);
+         if (ts_node_symbol(child) == sym_command)
+        {
+            return run_command_capture(child);
+        }
+        if (ts_node_symbol(child) == sym_pipeline)
+        {
+            return run_pipeline_capture(child);
+        }
+        return strdup("");
     }
     return ts_extract_node_text((char *)input, node);
 }
