@@ -131,6 +131,10 @@ get_job_from_jid(int jid)
     return NULL;
 }
 
+/**
+Adds the process pid to the jobs dynamic pid array
+which doubles when reaching capacity.
+ */
 static void 
 add_pid_to_job(struct job *job, pid_t pid)
 {
@@ -152,25 +156,34 @@ add_pid_to_job(struct job *job, pid_t pid)
     job->pids[job->num_pids++] = pid;
 }
  
+/**
+use a process pid to find which job it belongs to 
+ */
 static struct job *
 find_job_by_pid(pid_t pid)
 {
     struct list_elem *ele;
     ele = list_begin(&job_list);
 
+    // go through all the jobs in the job list 
     while ( ele != list_end(&job_list))
     {
         struct job *job = list_entry(ele, struct job, elem);
 
+        // iterate over each process pid in a specific job pid array 
         for (int i = 0; i < job->num_pids; i++)
         {
+            // if the current pid in the job list is the pid we are using for search
             if (job->pids[i] == pid)
             {
+                // return the job it belongs to
                 return job;
             }
         }
+        // Move to next job 
         ele = list_next(ele);
     }
+    // the pid isnt found by any job
     return NULL;
 }
 
@@ -178,7 +191,9 @@ find_job_by_pid(pid_t pid)
 static struct job *
 allocate_job(bool includeinjoblist)
 {
+    // allocate the memory for the job
     struct job * job = malloc(sizeof *job);
+    // initialize the job
     job->num_processes_alive = 0;
     job->jid = -1;
     job->pids =NULL;
@@ -186,9 +201,11 @@ allocate_job(bool includeinjoblist)
     job->cap_pids = 0;
     job->last_status = 0;
     if (!includeinjoblist)
-        return job;
+        return job; // new job structure that isnt tracked 
 
+    // add the jpb to the job list
     list_push_back(&job_list, &job->elem);
+    // find free slot for the jobID in the job list
     for (int i = 1; i < MAXJOBS; i++) {
         if (jid2job[i] == NULL) {
             jid2job[i] = job;
@@ -196,6 +213,7 @@ allocate_job(bool includeinjoblist)
             return job;
         }
     }
+    // if the job list capacity has been reached
     fprintf(stderr, "Maximum number of jobs exceeded\n");
     abort();
     return NULL;
@@ -354,20 +372,29 @@ handle_child_status(pid_t pid, int status)
         job->status = STOPPED;
 }
 
+/**  runs a single command where its stdout is sent into pipe instead of the shell
+stdout and returns a string
+*/
 static char *
 run_command_capture(TSNode command)
 {
+    // turn the Tree-Sitter command into and array of arguments
     char **argv = grab_argv(command, input, &shell_vars, last_exit_status);
 
     int pipefd[2];
+    // create a pipe so the stdout of the 
+    // command is sent and read by the shell
     if (pipe(pipefd) == -1)
     {
         utils_error("pipe failed");
         return strdup("");
     }
 
+    // create a new job and add it to the job list
     struct job *job = allocate_job(true);
+    // set it to be the foreground 
     job->status = FOREGROUND;
+    // set the number of preccess alive in the job to one 
     job->num_processes_alive = 1;
 
     posix_spawn_file_actions_t file_actions;
@@ -385,10 +412,12 @@ run_command_capture(TSNode command)
 
     posix_spawnattr_t attr;
     posix_spawnattr_init(&attr);
+    // add the spawned process into its own process group
     posix_spawnattr_setpgroup(&attr, 0);
     posix_spawnattr_setflags(&attr, POSIX_SPAWN_SETPGROUP);
 
     pid_t pid;
+    // start the command 
     int result = posix_spawnp(
         &pid,
         argv[0],
@@ -398,16 +427,18 @@ run_command_capture(TSNode command)
         environ
     );
 
+    // the spawn file actions are no longer needed so free
     posix_spawn_file_actions_destroy(&file_actions);
     posix_spawnattr_destroy(&attr);
 
     /* Parent does not write into the pipe. */
     close(pipefd[1]);
 
+    // if their is failed process creation
     if (result != 0)
     {
         close(pipefd[0]);
-
+        // free the command argument array
         for (int i = 0; argv[i] != NULL; i++)
             free(argv[i]);
         free(argv);
@@ -416,6 +447,7 @@ run_command_capture(TSNode command)
         return strdup("");
     }
 
+    // add the newly spawned process to a job in the job list
     add_pid_to_job(job, pid);
 
     /* Read everything the command wrote to stdout. */
@@ -426,8 +458,10 @@ run_command_capture(TSNode command)
     char buffer[128];
     ssize_t bytes;
 
+    // read the output of the pipe
     while ((bytes = read(pipefd[0], buffer, sizeof(buffer))) > 0)
     {
+        // Increase the output buffer if greater than cap
         if (length + bytes + 1 > capacity)
         {
             while (length + bytes + 1 > capacity)
@@ -436,14 +470,17 @@ run_command_capture(TSNode command)
             output = realloc(output, capacity);
         }
 
+        // add the read bytes to the outputed string 
         memcpy(output + length, buffer, bytes);
         length += bytes;
     }
-
+    // once parent is done reading, close the pipe
     close(pipefd[0]);
 
+    // wait for the job to register the finished command 
     wait_for_job_to_change_status(job, FOREGROUND);
 
+    // add the null terminator 
     output[length] = '\0';
 
     /* Bash removes trailing newlines from command substitution. */
@@ -452,30 +489,39 @@ run_command_capture(TSNode command)
         output[--length] = '\0';
     }
 
+    // remove the created job 
     delete_job(job, true);
 
+    // free the aruments in the array
     for (int i = 0; argv[i] != NULL; i++)
         free(argv[i]);
     free(argv);
 
+    // return the captured otput
     return output;
 }
 
+/*
+Runs a pipe and saves the stdout of the last command 
+*/
 static char *
 run_pipeline_capture(TSNode pipeline)
 {
-    uint32_t nde = ts_node_named_child_count(pipeline);
+    // get the number of commands in the pipeline 
+    uint32_t coms = ts_node_named_child_count(pipeline);
 
-    if (nde == 0)
+    // if the pipeline is empty then produce an empty output
+    if (coms == 0)
     {
         return strdup("");
     }
-
-    uint32_t num_pipes = nde - 1;
+    // get the amount of pipes 
+    uint32_t num_pipes = coms - 1;
 
     int (*pipes)[2] = NULL;
 
-    if (nde > 1)
+    // if there are more than 1 command set up the pipeline 
+    if (coms > 1)
     {
         pipes = malloc(sizeof(int[2]) * num_pipes);
 
@@ -503,16 +549,20 @@ run_pipeline_capture(TSNode pipeline)
         return strdup("");
     }
 
+    // create a job to track the process in the pipeline
     struct job *job = allocate_job(true);
     job->status = FOREGROUND;
     job->num_processes_alive = 0;
 
+    // is the pid of the first process 
     pid_t leader_pid = -1;
 
-    for (uint32_t i = 0; i < nde; i++)
+    // spawn each of the commands into the pipeline
+    for (uint32_t i = 0; i < coms; i++)
     {
         TSNode cmd_node = ts_node_named_child(pipeline, i);
 
+        // turn the current command into an argument array
         char **argv =
             grab_argv(cmd_node, input, &shell_vars, last_exit_status);
 
@@ -534,7 +584,7 @@ run_pipeline_capture(TSNode pipeline)
         /*
          * Intermediate commands write to the next pipe.
          */
-        if (i + 1 < nde)
+        if (i + 1 < coms)
         {
             posix_spawn_file_actions_adddup2(
                 &file_actions,
@@ -557,7 +607,7 @@ run_pipeline_capture(TSNode pipeline)
         /*
          * Close normal pipeline descriptors in the child.
          */
-        if (nde > 1)
+        if (coms > 1)
         {
             for (uint32_t j = 0; j < num_pipes; j++)
             {
@@ -589,12 +639,14 @@ run_pipeline_capture(TSNode pipeline)
         posix_spawnattr_t attr;
         posix_spawnattr_init(&attr);
 
+        // the first process creates the process group
         if (i == 0)
         {
             posix_spawnattr_setpgroup(&attr, 0);
         }
         else
         {
+            // set the other process's to the first process's group
             posix_spawnattr_setpgroup(&attr, leader_pid);
         }
 
@@ -605,6 +657,7 @@ run_pipeline_capture(TSNode pipeline)
 
         pid_t pid;
 
+        // spawn the current pipeline command 
         int spawn_result = posix_spawnp(
             &pid,
             argv[0],
@@ -617,6 +670,7 @@ run_pipeline_capture(TSNode pipeline)
         posix_spawn_file_actions_destroy(&file_actions);
         posix_spawnattr_destroy(&attr);
 
+        // free the current commands arguments
         for (int j = 0; argv[j] != NULL; j++)
         {
             free(argv[j]);
@@ -624,17 +678,20 @@ run_pipeline_capture(TSNode pipeline)
 
         free(argv);
 
+        // if th espawn failed
         if (spawn_result != 0)
         {
             utils_error("posix_spawnp failed");
             continue;
         }
 
+        // first process becomes the group leader 
         if (i == 0)
         {
             leader_pid = pid;
         }
 
+        // add the process to the job
         add_pid_to_job(job, pid);
         job->num_processes_alive++;
     }
@@ -642,7 +699,7 @@ run_pipeline_capture(TSNode pipeline)
     /*
      * Parent no longer needs the ordinary pipeline descriptors.
      */
-    if (nde > 1)
+    if (coms > 1)
     {
         for (uint32_t i = 0; i < num_pipes; i++)
         {
@@ -666,6 +723,7 @@ run_pipeline_capture(TSNode pipeline)
 
     ssize_t bytes;
 
+    // read the output
     while ((bytes = read(
                 capture_pipe[0],
                 buffer,
@@ -687,8 +745,10 @@ run_pipeline_capture(TSNode pipeline)
 
     close(capture_pipe[0]);
 
+    // wait for pipelineprocess to finish
     wait_for_job_to_change_status(job, FOREGROUND);
 
+    // add null terminator
     output[length] = '\0';
 
     /*
@@ -704,9 +764,13 @@ run_pipeline_capture(TSNode pipeline)
     return output;
 }
 
+/**
+Extracts the string by a tree-sitter word node 
+ */
 static char *
 word_node_extractor(TSNode node, const char *input, tommy_hashdyn *shell_vars, int last_status)
 {
+    // f the node is null
     if (ts_node_is_null(node))
     {
         return strdup("");
@@ -714,8 +778,10 @@ word_node_extractor(TSNode node, const char *input, tommy_hashdyn *shell_vars, i
 
     TSSymbol sym = ts_node_symbol(node);
 
+    // handles raw quoted strings
     if (sym == sym_raw_string)
     {
+        // find the start and end of the string
         uint32_t start = ts_node_start_byte(node);
         uint32_t end = ts_node_end_byte(node);
     
@@ -725,6 +791,7 @@ word_node_extractor(TSNode node, const char *input, tommy_hashdyn *shell_vars, i
         {
             // get the length of the string minus the quotes
             uint32_t length = end - start - 2;
+            // copy only the stuff between the quotes
             char *buf = malloc(length + 1);
             memcpy(buf, input + start + 1, length);
             buf[length] = '\0';
@@ -733,10 +800,12 @@ word_node_extractor(TSNode node, const char *input, tommy_hashdyn *shell_vars, i
         return ts_extract_node_text((char *)input, node);
     }   
 
+    // handles normal strings nad concateation 
     if (sym == sym_string || sym == sym_concatenation)
     {
         uint32_t child_count = ts_node_named_child_count(node);
 
+        // if there are no children nodes 
         if (sym == sym_string && child_count == 0)
         {
             uint32_t start = ts_node_start_byte(node);
@@ -746,18 +815,20 @@ word_node_extractor(TSNode node, const char *input, tommy_hashdyn *shell_vars, i
                 uint32_t length = end - start - 2;
                 char *result = malloc(length + 1);
 
+                // copy the contents without the quotes
                 memcpy(result, input + start + 1, length);
                 result[length] = '\0';
 
                 return result;
             }
         }
-
+        // build the resulting string 
         char *result = strdup("");
 
         for (uint32_t i = 0; i < child_count; i++)
         {
             TSNode child = ts_node_named_child(node, i);
+            // extract the value of each child 
             char *part = word_node_extractor(child, input, shell_vars, last_status);
             if (part)
             {
@@ -767,6 +838,7 @@ word_node_extractor(TSNode node, const char *input, tommy_hashdyn *shell_vars, i
         return result;
     }
 
+    // handles shell variables 
     if (sym == sym_expansion || sym == sym_simple_expansion)
     {
         TSNode var_name_node = ts_node_child_by_field_id(node, variableId);
@@ -775,6 +847,7 @@ word_node_extractor(TSNode node, const char *input, tommy_hashdyn *shell_vars, i
             var_name_node = ts_node_named_child(node, 0);
         }
 
+        // get the variable name 
         char *var_name = ts_extract_node_text((char *)input, var_name_node);
 
         //strip leading characters like $
@@ -825,19 +898,26 @@ word_node_extractor(TSNode node, const char *input, tommy_hashdyn *shell_vars, i
         {
             return strdup("");
         }
-         if (ts_node_symbol(child) == sym_command)
+        // capture a single command 
+        if (ts_node_symbol(child) == sym_command)
         {
             return run_command_capture(child);
         }
+        // run and capture pipeline
         if (ts_node_symbol(child) == sym_pipeline)
         {
             return run_pipeline_capture(child);
         }
         return strdup("");
     }
+    // for any other node just return the string
     return ts_extract_node_text((char *)input, node);
 }
 
+/*
+Create an argument array for commands.
+each arguent is taken from the tree-sitter node
+*/
 static char **
 grab_argv(TSNode command, const char *input, tommy_hashdyn *shell_vars, int last_status)
 {
@@ -865,15 +945,20 @@ grab_argv(TSNode command, const char *input, tommy_hashdyn *shell_vars, int last
     return argv;
 }
 
+/*
+deals with command lists using && and || 
+*/
 static void
 run_list(TSNode list_node)
 {
+    // the right and left side of the list
     TSNode left = ts_node_named_child(list_node, 0);
     TSNode right = ts_node_named_child(list_node, 1);
 
     bool is_and = false;
     bool is_or = false;
 
+    //check the list nodes to determine which operator
     uint32_t all_children = ts_node_named_child_count(list_node);
     for (uint32_t i = 0; i < all_children; i++)
     {
@@ -889,41 +974,53 @@ run_list(TSNode list_node)
         }
     }
 
+    // execute left since ledt to right
     run_statement(left);
+    // get the exit status of the left 
     int left_status = last_exit_status;
 
+    // if the exit status of left was sucessful and its &&
+    // then run right side 
     if (is_and && left_status == 0)
     {
         run_statement(right);
     }
+    // if the exit status is not valid but its an or then run right side
     if (is_or && left_status != 0)
     {
         run_statement(right);
     }
 }
 
-
+/*
+Applied redirections like < or > 
+*/
 static void
 apply_file_redirect(TSNode redirect,
                     posix_spawn_file_actions_t *file_actions)
 {
+    // find the destination
     TSNode destination =
         ts_node_child_by_field_id(redirect, destinationId);
 
+    // if no destination specified than set the first child 
     if (ts_node_is_null(destination))
     {
         destination = ts_node_named_child(redirect, 0);
     }
 
+    // get the filename
     char *filename =
         word_node_extractor(destination,
                             input,
                             &shell_vars,
                             last_exit_status);
 
+    // get what the actual redirection is
     char *redirect_text =
         ts_extract_node_text(input, redirect);
 
+    // '<' redirects the stdin from a file
     if (redirect_text[0] == '<')
     {
         posix_spawn_file_actions_addopen(
@@ -934,6 +1031,7 @@ apply_file_redirect(TSNode redirect,
             0
         );
     }
+    // '>&' redirects stdout to a file and stderr to 1 location 
     else if (strncmp(redirect_text, ">&", 2) == 0)
     {
         // Redirect stdout to the file
@@ -951,6 +1049,7 @@ apply_file_redirect(TSNode redirect,
             STDERR_FILENO
         );
     }
+    // '>' redirects stdout to a file
     else if (redirect_text[0] == '>')
     {
         posix_spawn_file_actions_addopen(
@@ -966,6 +1065,9 @@ apply_file_redirect(TSNode redirect,
     free(redirect_text);
 }
 
+/*
+checks a shell test command nad stores the exit status
+*/
 static void
 run_test_command(TSNode test_node)
 {
@@ -977,6 +1079,7 @@ run_test_command(TSNode test_node)
         return;
     }
 
+    // the first child holds the test expression
     TSNode expression = ts_node_named_child(test_node, 0);
 
     /*
@@ -1006,7 +1109,7 @@ run_test_command(TSNode test_node)
                 &shell_vars,
                 last_exit_status
             );
-
+        // check if the file is executable 
         if (strcmp(operator, "-x") == 0)
         {
             if (access(value, X_OK) == 0)
@@ -1028,12 +1131,15 @@ run_test_command(TSNode test_node)
 
         return;
     }
+    // handles binary expression
     else if (ts_node_symbol(expression) == sym_binary_expression)
     {
+        // get left and right side and the operator 
         TSNode left_node = ts_node_child_by_field_id(expression, leftId);
         TSNode operator_node = ts_node_child_by_field_id(expression, operatorId);
         TSNode right_node = ts_node_child_by_field_id(expression, rightId);
 
+        // convert left and right side to strings 
         char *left = word_node_extractor(left_node, input, &shell_vars, last_exit_status);
         char *op = ts_extract_node_text(input, operator_node);
         char *right = word_node_extractor(right_node, input, &shell_vars, last_exit_status);
@@ -1050,6 +1156,7 @@ run_test_command(TSNode test_node)
         {
             result = strcmp(left, right) != 0;
         }
+        // numeric equality 
         else if (strcmp(op, "-eq") == 0)
         {
             result = atol(left) == atol(right);
@@ -1059,31 +1166,38 @@ run_test_command(TSNode test_node)
         {
             result = atol(left) != atol(right);
         }
+        // less than
         else if (strcmp(op, "-lt") == 0)
         {
             result = atol(left) < atol(right);
         }
+        // less than or equal to
         else if (strcmp(op, "-le") == 0)
         {
             result = atol(left) <= atol(right);
         }
+        // greater than
         else if (strcmp(op, "-gt") == 0)
         {
             result = atol(left) > atol(right);
         }
+        //greater than or equal to
         else if (strcmp(op, "-ge") == 0)
         {
             result = atol(left) >= atol(right);
         }
+        // less than
         else if (strcmp(op, "<") == 0)
         {
             result = strcmp(left, right) < 0;
         }
+        // greater than
          else if (strcmp(op, ">") == 0)
         {
             result = strcmp(left, right) > 0;
         }
 
+        // the result is then turned to exit stauts 
         if (result)
         {
             last_exit_status = 0;
@@ -1102,6 +1216,7 @@ run_test_command(TSNode test_node)
     last_exit_status = 1;
 }
 
+// when a condition is true 
 static bool
 condition_is_true(TSNode condition)
 {
@@ -1117,9 +1232,15 @@ condition_is_true(TSNode condition)
     return last_exit_status == 0;
 }
 
+/*
+Determines what type of statement a tree-sitter node represents 
+and manages the execution of all the nodes
+*/
+
 static void
 run_statement(TSNode child)
 {
+    // if a system command
     if (ts_node_symbol(child) == sym_command)
         {
             run_command(child);
@@ -1131,6 +1252,7 @@ run_statement(TSNode child)
         }
         else if (ts_node_symbol(child) == sym_variable_assignment)
         {
+            // extract the variable name  and vlaue 
             TSNode name_node = ts_node_child_by_field_id(child, nameId);
             TSNode value_node = ts_node_child_by_field_id(child, valueId);
 
@@ -1141,44 +1263,54 @@ run_statement(TSNode child)
                 &shell_vars,
                 last_exit_status
             );
+            // store the variable in the variable hash table 
             hash_put(&shell_vars, name, value);
             free(name);
             free(value);
         }
+        // executre a pipeline 
         else if (ts_node_symbol(child) == sym_pipeline)
         {
             run_pipeline(child);
         }
+        //execute a redirection
         else if (ts_node_symbol(child) == sym_redirected_statement)
         {
             TSNode body = ts_node_named_child(child, 0);
             TSNode redirect = ts_node_named_child(child, 1);
 
+            // if a redirection in a system command
             if (ts_node_symbol(body) == sym_command)
             {
                 run_command_redirected(body, redirect);
             }
+            // if a redirection in a pipeline 
             else if (ts_node_symbol(body) == sym_pipeline)
             {
                 run_pipeline_redirected(body, redirect);
             }
         }
+        // execute a list
         else if (ts_node_symbol(child) == sym_list)
         {
             run_list(child);
         }
+        //execute an if statement 
         else if (ts_node_symbol(child) == sym_if_statement)
         {
             run_if_statement(child);
         }
+        // run a test command 
         else if (ts_node_symbol(child) == sym_test_command)
         {
             run_test_command(child);
         }
+        // execute a for loop
         else if (ts_node_symbol(child) == sym_for_statement)
         {
             run_for_statement(child);
         }
+        //execute a while loop
         else if (ts_node_symbol(child) == sym_while_statement)
         {
             run_while_statement(child);
@@ -1189,11 +1321,16 @@ run_statement(TSNode child)
         }
 }
 
+/*
+Executes statments within a group
+*/
 static void 
 run_group_statement(TSNode do_group)
 {
+    // get the number of statements 
     uint32_t count = ts_node_named_child_count(do_group);
 
+    // execute all the statments in order
     for (uint32_t i = 0; i < count; i++)
     {
         TSNode child = ts_node_named_child(do_group, i);
@@ -1204,6 +1341,7 @@ run_group_statement(TSNode do_group)
         }
         run_statement(child);
 
+        // if their is a break statement then break
         if (is_break)
         {
             break;
@@ -1211,6 +1349,9 @@ run_group_statement(TSNode do_group)
     }
 }
 
+/*
+executes a for loop
+*/
 static void 
 run_for_statement(TSNode for_node)
 {
@@ -1244,6 +1385,7 @@ run_for_statement(TSNode for_node)
     free(var_name);
 }
 
+//execute a while statment 
 static void 
 run_while_statement(TSNode while_node)
 {
@@ -1253,6 +1395,7 @@ run_while_statement(TSNode while_node)
     uint32_t start = ts_node_start_byte(while_node);
     bool is_until = strncmp(input + start, "until", 5) == 0;
 
+    // loop through until the condition fails
     for (;;)
     {
         bool cond_val = condition_is_true(condition);
@@ -1276,6 +1419,7 @@ run_while_statement(TSNode while_node)
     }
 }
 
+//execute an if statemnent 
 static void
 run_if_statement(TSNode if_node)
 {
@@ -1393,6 +1537,7 @@ run_if_statement(TSNode if_node)
     }
 }
 
+// executes a shell command
 static void 
 run_command(TSNode command)
 {
@@ -1402,6 +1547,7 @@ run_command(TSNode command)
     {
         last_exit_status = 0;
 
+        // free the argument array
         for (int i = 0; argv[i] != NULL; i++)
         {
             free(argv[i]);
@@ -1411,6 +1557,7 @@ run_command(TSNode command)
         return;
     }
 
+    // if their is a break then stop
     if (argv[0] != NULL && strcmp(argv[0], "break") == 0)
     {
         is_break = true;
@@ -1457,12 +1604,14 @@ run_command(TSNode command)
     posix_spawnattr_setflags(&attr, POSIX_SPAWN_SETPGROUP);
 
     pid_t pid;
+    //spawn the command
     int process = posix_spawnp(&pid, argv[0], &file_actions, &attr, argv, environ);
 
     // destroy the spawn object 
     posix_spawn_file_actions_destroy(&file_actions);
     posix_spawnattr_destroy(&attr);
 
+    // failed process handling 
     if (process != 0)
     {
         utils_error("posix_spawnp failed");
@@ -1489,26 +1638,34 @@ run_command(TSNode command)
 
 }
 
+/*
+Deals with redirections lie <, >, and >& 
+*/
 static void
 run_command_redirected(TSNode command, TSNode redirect)
 {
+    // turn the command into an arugment array
     char **argv = grab_argv(command, input, &shell_vars, last_exit_status);
 
+    //create job for the command
     struct job *job = allocate_job(true);
     job->status = FOREGROUND;
     job->num_processes_alive = 1;
 
+    // create the spawn file-action structure
     posix_spawn_file_actions_t file_actions;
     posix_spawn_file_actions_init(&file_actions);
-
+    // execute file redirection 
     apply_file_redirect(redirect, &file_actions);
 
     posix_spawnattr_t attr;
     posix_spawnattr_init(&attr);
+    // put the command into process group
     posix_spawnattr_setpgroup(&attr, 0);
     posix_spawnattr_setflags(&attr, POSIX_SPAWN_SETPGROUP);
 
     pid_t pid;
+    // spawn the command that was redirected
     int process = posix_spawnp(
         &pid,
         argv[0],
@@ -1520,11 +1677,12 @@ run_command_redirected(TSNode command, TSNode redirect)
 
     posix_spawn_file_actions_destroy(&file_actions);
     posix_spawnattr_destroy(&attr);
-
+    // handle failed process creation
     if (process != 0)
     {
         utils_error("posix_spawnp failed");
 
+        // free the command arguments
         for (int i = 0; argv[i] != NULL; i++)
         {
             free(argv[i]);
@@ -1535,12 +1693,13 @@ run_command_redirected(TSNode command, TSNode redirect)
         return;
     }
 
+    // add the spawned process to the job
     add_pid_to_job(job, pid);
-
+    // wait for the process to finish 
     wait_for_job_to_change_status(job, FOREGROUND);
-
+    // save the exit status of the process 
     last_exit_status = job->last_status;
-
+    // free jobs and arguments
     delete_job(job, true);
 
     for (int i = 0; argv[i] != NULL; i++)
@@ -1551,16 +1710,19 @@ run_command_redirected(TSNode command, TSNode redirect)
     free(argv);
 }
 
-
+/*
+deals with executing pipelines
+*/
 static void 
 run_pipeline(TSNode pipeline)
 {
+    // the amount of commands in the pipeline
     uint32_t nde = ts_node_named_child_count(pipeline);
     if (nde == 0)
     {
         return;
     }
-
+    // get the number of pipes 
     uint32_t num_pipes = nde - 1;
 
     int (*pipes)[2] = NULL;
@@ -1578,6 +1740,7 @@ run_pipeline(TSNode pipeline)
         }
     }
 
+    // create a job to track process in the pipeline 
     struct job *job = allocate_job(true);
     job->status = FOREGROUND;
     job->num_processes_alive = 0;
@@ -1585,6 +1748,7 @@ run_pipeline(TSNode pipeline)
     // process group leader
     pid_t leader_pid = -1;
 
+    //spawn all the commans 
     for (uint32_t i = 0; i < nde; i++)
     {
         TSNode cmd_node = ts_node_named_child(pipeline, i);
@@ -1650,6 +1814,7 @@ run_pipeline(TSNode pipeline)
         posix_spawnattr_t attr;
         posix_spawnattr_init(&attr);
 
+        // process leader is the first in the group
         if (i == 0)
         {
             // set the first process as the froup leader 
@@ -1657,14 +1822,17 @@ run_pipeline(TSNode pipeline)
         }
         else
         {
+            // add process that come lader to that group
             posix_spawnattr_setpgroup(&attr, leader_pid);
         }
         posix_spawnattr_setflags(&attr, POSIX_SPAWN_SETPGROUP);
 
         pid_t pid;
 
+        // spawn the current pipeline command 
         int spawn_result = posix_spawnp(&pid, argv[0], &file_actions, &attr, argv, environ);
 
+        // delete spawn configuration 
         posix_spawn_file_actions_destroy(&file_actions);
         posix_spawnattr_destroy(&attr);
 
@@ -1674,21 +1842,24 @@ run_pipeline(TSNode pipeline)
         }
         free(argv);
 
+        // if command does not spawn then continue
         if (spawn_result != 0)
         {
             utils_error("posix_spawnp failed");
             continue;
         }
 
+        // save first process id as group leader
         if ( i == 0)
         {
             leader_pid = pid;
         }
-
+        // add the process id to the job
         add_pid_to_job(job, pid);
         job->num_processes_alive++;
     }
 
+    // the paretn no longer needs the pipe 
     if (nde > 1)
     {
         for ( uint pcount = 0 ; pcount < num_pipes; pcount++)
@@ -1699,6 +1870,7 @@ run_pipeline(TSNode pipeline)
     }
     free(pipes);
 
+    // wait for the pipeline to finish
     wait_for_job_to_change_status(job, FOREGROUND);
     last_exit_status = job->last_status;
     delete_job(job, true);
